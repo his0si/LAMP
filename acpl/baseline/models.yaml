@@ -1,0 +1,45 @@
+models:
+  llama31_8b_instruct:
+    repo_id: meta-llama/Meta-Llama-3.1-8B-Instruct
+    role: main_baseline
+    family: llama
+    size: 8B
+    gated: true
+    local_dir: baseline/models/llama31_8b_instruct
+    notes: "Main reference model; grouped-query attention decoder with long-context support."
+
+  qwen25_7b_instruct:
+    repo_id: Qwen/Qwen2.5-7B-Instruct
+    role: cross_family_generalization
+    family: qwen
+    size: 7B
+    gated: false
+    local_dir: baseline/models/qwen25_7b_instruct
+    notes: "Different decoder family for checking whether layer-wise mixed precision transfers beyond Llama."
+
+  gemma2_9b_it:
+    repo_id: google/gemma-2-9b-it
+    role: medium_model_comparison
+    family: gemma
+    size: 9B
+    gated: true
+    local_dir: baseline/models/gemma2_9b_it
+    notes: "Medium Gemma; close to the 7B/8B scale but a different family."
+
+  gemma2_2b_it:
+    repo_id: google/gemma-2-2b-it
+    role: small_gemma_comparison
+    family: gemma
+    size: 2B
+    gated: true
+    local_dir: baseline/models/gemma2_2b_it
+    notes: "Small Gemma counterpart to gemma2_9b_it; holds family fixed while varying scale (small vs medium)."
+
+  qwen25_15b_instruct:
+    repo_id: Qwen/Qwen2.5-1.5B-Instruct
+    role: fast_sweep_ablation
+    family: qwen
+    size: 1.5B
+    gated: false
+    local_dir: baseline/models/qwen25_15b_instruct
+    notes: "Small, permissive, and fast enough for sweep/debug/ablation loops."

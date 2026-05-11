@@ -15,11 +15,19 @@ __pycache__/
 *.py[cod]
 
 # Local model/data artifacts
+# Original (root) location:
 baseline/models/
+# Per-server folders (acpl/, RT-Server/, …) — match at any depth:
+**/baseline/models/
 data/
 outputs/
 results/
 runs/
+
+# Node tooling (Claude Code 등에서 생기는 임시 파일)
+node_modules/
+package.json
+package-lock.json
 
 # Hugging Face / experiment caches
 .cache/
@@ -30,3 +38,6 @@ mlruns/
 .DS_Store
 .vscode/
 .idea/
+
+.claude/
+.github/

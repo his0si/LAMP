@@ -1,4 +1,4 @@
-name: LAMP
+name: LAMP_RT
 channels:
   - conda-forge
 dependencies:

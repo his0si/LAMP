@@ -24,16 +24,16 @@ models:
     size: 9B
     gated: true
     local_dir: baseline/models/gemma2_9b_it
-    notes: "Default Gemma choice because it is close to the 7B/8B baselines while representing a distinct family."
+    notes: "Medium Gemma; close to the 7B/8B scale but a different family."
 
   gemma2_2b_it:
     repo_id: google/gemma-2-2b-it
-    role: optional_small_gemma
+    role: small_gemma_comparison
     family: gemma
     size: 2B
     gated: true
     local_dir: baseline/models/gemma2_2b_it
-    notes: "Use instead of gemma2_9b_it when VRAM, disk budget, or iteration time is the bottleneck."
+    notes: "Small Gemma counterpart to gemma2_9b_it; holds family fixed while varying scale (small vs medium)."
 
   qwen25_15b_instruct:
     repo_id: Qwen/Qwen2.5-1.5B-Instruct
