@@ -1,0 +1,32 @@
+# Local Python virtual environment.
+# Created by tools such as python -m venv; contains installed packages and
+# machine-specific interpreter paths.
+.venv/
+
+# Local Codex agent workspace metadata.
+# May contain session state, tool/cache files, and local automation artifacts.
+.codex/
+
+# Local multi-agent/assistant workspace metadata.
+# May contain generated task state or plugin/agent runtime files.
+.agents/
+
+__pycache__/
+*.py[cod]
+
+# Local model/data artifacts
+baseline/models/
+data/
+outputs/
+results/
+runs/
+
+# Hugging Face / experiment caches
+.cache/
+wandb/
+mlruns/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
