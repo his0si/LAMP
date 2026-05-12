@@ -240,11 +240,11 @@ become `ok: llama`.
 
 | Key | 상태 |
 | --- | --- |
-| `qwen25_7b_instruct` | ✅ 15 GB 완료 |
-| `gemma2_9b_it` | ✅ 18 GB 완료 |
-| `gemma2_2b_it` | ✅ 4.9 GB 완료 |
-| `qwen25_15b_instruct` | ✅ 2.9 GB 완료 · smoke test 통과 |
-| `llama31_8b_instruct` | ❌ Meta Llama 라이선스 review 대기 |
+| `qwen25_7b_instruct` | done 15 GB 완료 |
+| `gemma2_9b_it` | done 18 GB 완료 |
+| `gemma2_2b_it` | done 4.9 GB 완료 |
+| `qwen25_15b_instruct` | done 2.9 GB 완료 · smoke test 통과 |
+| `llama31_8b_instruct` | not yet Meta Llama 라이선스 review 대기 |
 
 `acpl/baseline/models/` 총 용량 ~40 GB. Llama 승인 시 ~56 GB로 늘어남.
 

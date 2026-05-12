@@ -1,0 +1,18 @@
+# Third-party source builds (Timeloop / Accelergy clones)
+third_party/
+
+# GPTQ run logs scattered in the root by gptqmodel
+gptq_log_*.log
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
