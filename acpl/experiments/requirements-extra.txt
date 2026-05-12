@@ -1,0 +1,27 @@
+# LAMP experiment-only extras.
+# Install AFTER the base LAMP_acpl environment (see ../README.md sections 3-3 / 3-4).
+#
+# Usage:
+#   conda activate LAMP_acpl
+#   python -m pip install -r experiments/requirements-extra.txt
+#
+# Timeloop + Accelergy are NOT pip-installable. See experiments/README.md §3.
+
+# ---- Quantization backend ----
+# GPTQ via Optimum integration (works against Transformers >= 4.57).
+# Optimum picks up gptqmodel automatically on import.
+optimum>=1.23.0
+gptqmodel>=1.9.0
+
+# ---- Eval ----
+# lm-evaluation-harness for downstream benchmarks (MMLU, ARC, HellaSwag, ...).
+lm-eval>=0.4.4
+
+# ---- Numerics / plotting ----
+scipy>=1.13.0
+matplotlib>=3.9.0
+seaborn>=0.13.0
+
+# ---- Convenience ----
+typer>=0.12.0          # CLI ergonomics for run_*.py scripts
+pynvml>=11.5.0         # NVML power readings for energy/token estimates

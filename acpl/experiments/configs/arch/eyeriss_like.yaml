@@ -1,0 +1,43 @@
+# Eyeriss-like spatial array, parameterized for a Timeloop run.
+# This file is consumed by lamp.hw_timeloop to generate the full
+# Timeloop input set (arch + components + constraints + mapping problem).
+#
+# We keep the YAML small and human-editable; the wrapper materializes the
+# full Timeloop YAML on disk per (layer × precision) before launching the
+# mapper. See experiments/README.md §6 for measurement methodology.
+
+name: eyeriss_like_v1
+
+pe_array:
+  rows: 16
+  cols: 16
+  # Compute element: MAC with operand-precision-aware energy/area scaling.
+  # Accelergy multiplier-array primitive handles the bit-width dependence.
+  mac_primitive: intmac
+  mac_supported_bits: [4, 8, 16]
+
+memory_hierarchy:
+  # Innermost → outermost. Sizes in bytes.
+  - level: regfile
+    size: 512
+    bandwidth_GBps: per_pe          # private to each PE
+  - level: l1_scratchpad
+    size: 16384
+    bandwidth_GBps: 256
+  - level: global_buffer
+    size: 1048576                   # 1 MiB
+    bandwidth_GBps: 128
+  - level: dram
+    size: -1                        # unbounded
+    bandwidth_GBps: 32              # HBM-class assumption; adjust per arch
+
+clock_GHz: 1.0
+
+# Reported metrics the wrapper extracts from Timeloop stats.txt:
+report_metrics:
+  - cycles
+  - pj_per_compute
+  - pj_per_op           # total energy / total ops
+  - pe_utilization
+  - dram_traffic_bytes
+  - gbuf_hit_rate       # derived from accesses

@@ -1,0 +1,35 @@
+defaults:
+  models_root: ../../baseline/models
+  dtype: float16
+  calib_dataset: wikitext
+  calib_split: train
+  calib_num_samples: 32
+  calib_seqlen: 2048
+targets:
+  qwen25_15b_instruct:
+    repo: Qwen/Qwen2.5-1.5B-Instruct
+    local_dir: qwen25_15b_instruct
+    num_hidden_layers: 28
+    hidden_size: 1536
+    intermediate_size: 8960
+    num_attention_heads: 12
+    num_kv_heads: 2
+    sweep_default: true
+  qwen25_7b_instruct:
+    repo: Qwen/Qwen2.5-7B-Instruct
+    local_dir: qwen25_7b_instruct
+    num_hidden_layers: 28
+    hidden_size: 3584
+    intermediate_size: 18944
+    num_attention_heads: 28
+    num_kv_heads: 4
+    sweep_default: false
+  gemma2_2b_it:
+    repo: google/gemma-2-2b-it
+    local_dir: gemma2_2b_it
+    num_hidden_layers: 26
+    hidden_size: 2304
+    intermediate_size: 9216
+    num_attention_heads: 8
+    num_kv_heads: 4
+    sweep_default: false

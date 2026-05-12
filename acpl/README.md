@@ -331,11 +331,11 @@ CUDA_VISIBLE_DEVICES=0 python baseline/smoke_test.py gemma2_9b_it --load-in-4bit
 
 | Key | 로컬 상태 |
 | --- | --- |
-| `qwen25_7b_instruct` | ✅ 15 GB 다운로드 완료 |
-| `gemma2_9b_it` | ✅ 18 GB 다운로드 완료 |
-| `gemma2_2b_it` | ✅ 4.9 GB 다운로드 완료 |
-| `qwen25_15b_instruct` | ✅ 2.9 GB 다운로드 완료, smoke test 통과 |
-| `llama31_8b_instruct` | ❌ Meta Llama 라이선스 review 대기 (`GatedRepoError: 403`) |
+| `qwen25_7b_instruct` | done 15 GB 다운로드 완료 |
+| `gemma2_9b_it` | done 18 GB 다운로드 완료 |
+| `gemma2_2b_it` | done 4.9 GB 다운로드 완료 |
+| `qwen25_15b_instruct` | done 2.9 GB 다운로드 완료, smoke test 통과 |
+| `llama31_8b_instruct` | not yet Meta Llama 라이선스 review 대기 (`GatedRepoError: 403`) |
 
 승인된 뒤 Llama만 별도로 받으려면:
 

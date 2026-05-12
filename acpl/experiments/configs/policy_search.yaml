@@ -1,0 +1,18 @@
+# Mixed-precision policy search settings.
+#
+# Concept: we have per-layer sensitivity scores S[l] computed in Phase 1
+# (perplexity delta when only layer l is quantized at width b).
+# Goal: assign bit-width B[l] ∈ allowed_widths to minimize accuracy loss
+# subject to an average bit-width budget.
+
+allowed_widths: [4, 8]              # add 3 / 16 if your quant backend supports it
+target_avg_bits: 5.0                # budget across attn+mlp linears
+weight_metric: ppl_delta            # which sensitivity score to use
+search:
+  method: greedy                    # greedy | ilp
+  # Greedy: start everyone at min width, promote the highest-S layer one step at a time
+  # until budget is hit. Cheap, near-optimal in practice when S is monotone.
+  group_scope: per_layer            # per_layer | per_module (q/k/v/o/gate/up/down separately)
+ties:
+  prefer_earlier_layer_lower_bits: true   # break ties toward earlier layers using fewer bits
+output_path: ../results/policies    # {target}_{avg_bits}bit.yaml will land here

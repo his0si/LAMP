@@ -1,0 +1,7 @@
+# All experiment outputs live here; never commit them.
+results/
+
+# Local caches & venv crumbs
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
