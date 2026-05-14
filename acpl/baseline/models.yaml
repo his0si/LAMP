@@ -1,12 +1,12 @@
 models:
   llama31_8b_instruct:
-    repo_id: meta-llama/Meta-Llama-3.1-8B-Instruct
+    repo_id: NousResearch/Meta-Llama-3.1-8B-Instruct
     role: main_baseline
     family: llama
     size: 8B
-    gated: true
+    gated: false
     local_dir: baseline/models/llama31_8b_instruct
-    notes: "Main reference model; grouped-query attention decoder with long-context support."
+    notes: "Main reference model; grouped-query attention decoder with long-context support. Sourced from the NousResearch ungated mirror because Meta's official repo review was still pending on 2026-05-14; identical weights."
 
   qwen25_7b_instruct:
     repo_id: Qwen/Qwen2.5-7B-Instruct

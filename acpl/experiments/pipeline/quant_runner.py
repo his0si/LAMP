@@ -15,16 +15,43 @@ from typing import Iterable
 import yaml
 
 
-def build_dynamic_overrides(policy_yaml_path: Path | str) -> dict[str, dict]:
-    """Map per-layer bit choices into the regex-keyed dict GPTQModel expects.
+_ATTN_PROJS = {"q_proj", "k_proj", "v_proj", "o_proj"}
+_MLP_PROJS = {"gate_proj", "up_proj", "down_proj"}
 
-    For HF Qwen2/Llama style models, transformer blocks live under
-    `model.layers.<idx>.{self_attn.q_proj, ..., mlp.down_proj}`. We promote
-    the layer-level decision to every linear inside that layer.
+
+def build_dynamic_overrides(policy_yaml_path: Path | str) -> dict[str, dict]:
+    """Map a policy YAML into the regex-keyed dict GPTQModel expects.
+
+    Supports two policy formats produced by the pipeline:
+    - per-layer (`per_layer_bits`): one bit-width per transformer block,
+      promoted to every linear inside that block.
+    - per-tile (`per_tile_bits`): one bit-width per (block, projection),
+      keyed like `L00.q_proj`. Used by E4 hardware-normalized policies.
+
+    For HF Qwen2/Llama/Gemma2 the projections live under
+    `model.layers.<idx>.self_attn.{q,k,v,o}_proj` and
+    `model.layers.<idx>.mlp.{gate,up,down}_proj`.
     """
     pol = yaml.safe_load(Path(policy_yaml_path).read_text())
     base_width = min(pol["allowed_widths"])
     overrides: dict[str, dict] = {}
+
+    if "per_tile_bits" in pol:
+        for tile_key, bits in pol["per_tile_bits"].items():
+            if bits == base_width:
+                continue
+            layer_tag, proj = tile_key.split(".", 1)
+            idx = int(layer_tag.lstrip("L"))
+            if proj in _ATTN_PROJS:
+                submod = f"self_attn.{proj}"
+            elif proj in _MLP_PROJS:
+                submod = f"mlp.{proj}"
+            else:
+                raise ValueError(f"unknown projection in per_tile_bits: {proj}")
+            pattern = rf"model\.layers\.{idx}\.{submod}$"
+            overrides[pattern] = {"bits": bits}
+        return overrides
+
     for idx, bits in enumerate(pol["per_layer_bits"]):
         if bits == base_width:
             continue

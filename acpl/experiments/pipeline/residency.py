@@ -5,10 +5,16 @@ decoder weights, we cannot keep everything resident. The scheduler decides
 which **(layer_idx, projection)** weight tiles to pin in GBuf so they
 don't need re-reading from DRAM every token.
 
-Two schedulers we compare:
+Three schedulers we compare:
 
   * **precision_aware**: knows the per-layer bit-width policy and uses
-    the *actual* tile bytes for packing. Can fit more tiles.
+    the *actual* tile bytes for packing with the smallest-first knapsack
+    rule. Can fit more tiles than oblivious; also uses a better solver
+    than random.
+  * **precision_aware_random**: also knows the policy and uses actual
+    tile bytes for the budget check, but selects tiles uniformly at
+    random (averaged over multiple seeds). Isolates the contribution of
+    the *solver* on top of precision awareness.
   * **precision_oblivious_int8**: budgets every tile at the worst case
     bit-width (INT8 in our setup). Reflects a deployment-time scheduler
     that ignores the policy. Pins fewer tiles → more DRAM traffic.
@@ -26,6 +32,7 @@ is the right efficiency proxy.
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal
@@ -36,7 +43,12 @@ from . import config
 
 # Per-block linear shapes are the seven projections; we enumerate them
 # per layer so the scheduler can pin individual (layer, role) tiles.
-SchedStrategy = Literal["precision_aware", "precision_oblivious_int8"]
+SchedStrategy = Literal[
+    "precision_aware",
+    "precision_aware_random",
+    "precision_oblivious_int8",
+]
+RANDOM_SEEDS = (0, 1, 2, 3, 4, 5, 6, 7)
 PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj",
                "gate_proj", "up_proj", "down_proj")
 
@@ -134,6 +146,26 @@ def pack_greedy(tiles: Iterable[WeightTile], gbuf_bytes: int,
     return pinned
 
 
+def pack_random(tiles: Iterable[WeightTile], gbuf_bytes: int,
+                size_attr: str, seed: int) -> set[str]:
+    """Random 0/1 knapsack: same budget check as ``pack_greedy`` but visits
+    tiles in a uniformly-random order. A weaker solver that still knows the
+    actual per-tile cost; comparing this to ``pack_greedy`` isolates the
+    contribution of the smallest-first rule on top of precision awareness.
+    """
+    order = list(tiles)
+    rng = random.Random(seed)
+    rng.shuffle(order)
+    pinned: set[str] = set()
+    used = 0
+    for t in order:
+        sz = getattr(t, size_attr)
+        if used + sz <= gbuf_bytes:
+            pinned.add(t.key)
+            used += sz
+    return pinned
+
+
 def schedule_dram_per_token(
     tiles: list[WeightTile],
     gbuf_bytes: int,
@@ -152,6 +184,30 @@ def schedule_dram_per_token(
         # Scheduler budgets every tile at INT8; pinned tiles physically occupy
         # only bytes_aware, but its decision-making uses bytes_int8.
         pinned = pack_greedy(tiles, gbuf_bytes, "bytes_int8")
+    elif strategy == "precision_aware_random":
+        # Same byte awareness as precision_aware, but a uniformly-random
+        # visiting order instead of smallest-first. Return the mean DRAM
+        # bytes per token across RANDOM_SEEDS so the result is stable.
+        seed_dram: list[int] = []
+        seed_pinned_count: list[int] = []
+        seed_pinned_aware: list[int] = []
+        for s in RANDOM_SEEDS:
+            p = pack_random(tiles, gbuf_bytes, "bytes_aware", seed=s)
+            seed_pinned_count.append(len(p))
+            seed_pinned_aware.append(sum(t.bytes_aware for t in tiles if t.key in p))
+            total = sum(t.bytes_aware for t in tiles)
+            seed_dram.append(total - seed_pinned_aware[-1])
+        return {
+            "strategy": strategy,
+            "gbuf_bytes": gbuf_bytes,
+            "pinned_count": int(round(sum(seed_pinned_count) / len(RANDOM_SEEDS))),
+            "pinned_keys": [],  # varies per seed; not meaningful to report
+            "pinned_bytes_aware": int(round(sum(seed_pinned_aware) / len(RANDOM_SEEDS))),
+            "pinned_bytes_budget": int(round(sum(seed_pinned_aware) / len(RANDOM_SEEDS))),
+            "dram_bytes_per_token": int(round(sum(seed_dram) / len(RANDOM_SEEDS))),
+            "total_decoder_bytes_aware": sum(t.bytes_aware for t in tiles),
+            "n_seeds": len(RANDOM_SEEDS),
+        }
     else:
         raise ValueError(strategy)
 
@@ -185,7 +241,8 @@ def compare(
     tiles = enumerate_tiles(target_cfg, policy_yaml)
     rows: list[dict] = []
     for g in gbuf_sizes_bytes:
-        for strat in ("precision_aware", "precision_oblivious_int8"):
+        for strat in ("precision_aware", "precision_aware_random",
+                      "precision_oblivious_int8"):
             r = schedule_dram_per_token(tiles, g, strat)
             r["policy"] = Path(policy_yaml).stem
             rows.append(r)

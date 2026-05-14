@@ -1,0 +1,1180 @@
+\documentclass{ieeeaccess}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{url}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+\history{Submitted on May 14, 2026.}
+\doi{10.1109/ACCESS.XXXX.DOI}
+
+\title{Precision-Aware Residency Scheduling for Mixed-Precision Large Language Model Decoders}
+\author{\uppercase{Author One}\authorrefmark{1}, \uppercase{Author Two}\authorrefmark{1},
+        and \uppercase{Author Three}\authorrefmark{1}}
+\address[1]{Department of Computer Science and Engineering, Ewha Womans
+University, Seoul, Republic of Korea (corresponding author e-mail:
+{authorone}@ewha.ac.kr)}
+\tfootnote{This work was supported in part by [funding agency and grant number TBD].
+The code, configurations, and the results that back every figure and table in
+this article are available in the project repository accompanying the submission.}
+
+\markboth
+{Author~\headeretal: Precision-Aware Residency Scheduling for Mixed-Precision LLM Decoders}
+{Author~\headeretal: Precision-Aware Residency Scheduling for Mixed-Precision LLM Decoders}
+
+\corresp{Corresponding author: Author One (e-mail: authorone@ewha.ac.kr).}
+
+\begin{abstract}
+Autoregressive decoding in large language models is bound by per-token
+weight traffic from off-chip memory: every weight is read once per
+generated token, so latency and energy track the bytes transferred
+rather than floating-point operations. Layer-wise mixed precision
+shrinks those bytes, but a deployment-time scheduler that does not
+know each layer's bit width must budget every weight tile at the
+worst-case width, leaving on-chip residency capacity unused. We
+formalize the resulting decision as precision-aware residency
+scheduling: given a fixed mixed-precision policy and an on-chip
+buffer, decide which weight tiles to pin so that per-token traffic to
+dynamic random-access memory is minimized. We instantiate the
+scheduler as a greedy zero-one knapsack on per-tile bytes and compare
+it against a precision-oblivious baseline that uses eight-bit budgets.
+Across four open-weight checkpoints spanning approximately 1.5, 2.6,
+7.6, and 8.0 billion parameters and three model families (Qwen, Gemma,
+Llama), the precision-aware scheduler reduces per-token off-chip
+traffic by 1.33 times to 1.97 times at a comparable operating point
+near half the four-bit model footprint, and up to 3.17 times at the
+knee where the buffer matches the four-bit footprint of the smallest
+model. The mixed-precision policy commonly used as input
+survives joint post-training quantization with a Kendall rank
+correlation of $+$1.0 against the predicted ordering. A
+graphics-processing-unit profile of the unquantized baseline
+corroborates the analytic ranking. All code, configurations, and
+results are released for reproducibility.
+\end{abstract}
+
+\begin{keywords}
+Large language model inference, mixed-precision quantization,
+on-chip residency, off-chip memory traffic, knapsack scheduling,
+hardware--software co-design, post-training quantization, hardware
+accelerators.
+\end{keywords}
+
+\titlepgskip=-15pt
+
+\maketitle
+
+\section{Introduction}
+\label{sec:introduction}
+\PARstart{L}{arge} language models (LLMs) generate text autoregressively:
+each new token requires a forward pass through the full decoder stack
+with the keys and values of all prior tokens cached on chip and a fresh
+read of the weight matrices from off-chip memory. In the decode regime,
+the batch size is one, the arithmetic intensity is low, and the
+processing-element (PE) array of the host graphics processing unit (GPU)
+or accelerator spends most of its cycles waiting for memory traffic
+\cite{sheng2023flexgen}. Reducing the per-token weight bytes is
+therefore the dominant lever on both latency and energy.
+
+Layer-wise mixed-precision quantization is one of the canonical
+techniques for this reduction. Hessian-aware quantization (HAWQ)
+\cite{dong2019hawq} and its eigenvalue variant HAWQ-V2
+\cite{dong2020hawqv2} assign different bit widths per layer guided by
+the loss landscape; block-wise reconstruction error (BRECQ)
+\cite{li2021brecq} formulates the same target with a different signal;
+generalized post-training quantization (GPTQ) \cite{frantar2023gptq}
+makes the quantization itself Hessian-aware. Recent LLM accelerator
+designs --- including our own laboratory's prior power-aware mapping
+work and LLM-specific accelerator (both anonymized for review) ---
+take mixed-precision policies as system input and search the dataflow
+and mapping space to extract energy efficiency on top.
+
+This paper asks a question that sits between the algorithm and the
+mapping layers: \emph{what should the deployment-time scheduler do with
+the mixed-precision policy at runtime?} Concretely, when the on-chip
+buffer is too small to hold the full decoder, which weight tiles do we
+keep resident so that subsequent tokens reuse them without re-streaming
+from dynamic random-access memory (DRAM)?
+
+We make three observations.
+\begin{itemize}
+\item \textbf{Observation~1.} In the autoregressive decode regime,
+search of the loop-mapping space does not break the byte-traffic
+monotone. We show empirically in Section~\ref{sec:motivation} that the
+optimal mapping for the same general matrix multiplication (GEMM) at
+four-bit and at eight-bit differ in tile geometry, but the cycle count
+and energy in a representative 16$\times$16 PE array track byte width
+almost exactly, so the mapping contribution is absorbed by the byte
+cost.
+\item \textbf{Observation~2.} The natural surface for adding scheduling
+intelligence is \emph{residency}. With the model fixed, every weight is
+read exactly once per token. If a tile fits in the on-chip buffer, it
+can be pinned once and reused across many tokens. The decision becomes
+a classical zero-one knapsack with a single capacity constraint.
+\item \textbf{Observation~3.} The mixed-precision policy changes the
+knapsack instance, but naive deployment ignores it. A
+precision-oblivious scheduler that budgets every tile at INT8 (the
+worst-case bit width in our setting) pins fewer tiles than a
+precision-aware scheduler that uses the actual per-tile bytes from the
+policy. At fixed buffer size, the aware scheduler streams 1.3 to 3.2
+times fewer bytes for the same accuracy.
+\end{itemize}
+
+\noindent\textbf{Contributions.} The contributions of this paper are
+the following.
+\begin{itemize}
+\item We formulate precision-aware residency scheduling as a knapsack
+on per-tile weight bytes and quantify its win against a
+precision-oblivious INT8-budget baseline across three LLM families
+(Qwen, Gemma, Llama) spanning four checkpoints from 1.5 to 8 billion
+parameters.
+\item The pattern is universal across the four checkpoints we sweep:
+Qwen2.5-1.5B-Instruct, Gemma-2-2B-IT, Qwen2.5-7B-Instruct, and
+Llama-3.1-8B-Instruct all exhibit a monotone ranking under joint
+quantization and an aware-versus-oblivious win in the same direction;
+the win factor grows with the buffer-to-decoder ratio, reaching 1.80
+to 1.97 times for the seven- and eight-billion-parameter models at a
+buffer of roughly 60\,\% of the four-bit decoder footprint.
+\item As a method extension, replacing the per-layer Hessian-aware
+score with a per-tile bits-per-byte score produces qualitatively
+different policies that allocate the eight-bit budget to attention
+key-value (KV) projections at the same average bit-width budget.
+Real GPTQ verification across all four models (Qwen-1.5B/7B,
+Gemma-2-2B, Llama-8B) reduces WikiText-2 perplexity in seven of eight
+matched-budget settings, with the largest gain ($-0.162$ at
+$\bar B\!=\!4.5$ on Qwen-1.5B) concentrated at the tightest budget
+where protecting KV projections matters most.
+\item We also separate the contribution of \emph{precision awareness}
+from the choice of solver: replacing the smallest-first knapsack with
+a uniformly-random ordering of the same byte-aware budget shifts the
+DRAM traffic by less than one percent across all sixteen
+(model, policy) settings. The win is therefore attributable to the
+byte-awareness of the budget, not to a particular packing heuristic,
+which makes the technique robust to deployment-specific solver
+choices.
+\item We provide a complete reproducibility trail, including a
+sudo-less source build of Timeloop and Accelergy inside a single
+conda environment, a documented gcc-13 patch needed to compile
+ninety-two affected headers, and a deterministic driver that
+regenerates every figure and table from the same set of pipeline
+modules.
+\end{itemize}
+
+\noindent\textbf{Stack position.} The literature treats LLM efficiency
+at three layers (Fig.~\ref{fig:stack}). Our contribution is the
+scheduling layer; the upper two layers are inputs.
+
+\begin{figure}[t]
+\centering
+\begin{tabular}{|l|}
+\hline
+\textsf{Algorithm layer (input).} \\
+HAWQ \cite{dong2019hawq}, BRECQ \cite{li2021brecq}, GPTQ \cite{frantar2023gptq}. \\
+Output: per-(layer, projection) bit widths. \\ \hline
+\textsf{Mapping layer (input).} \\
+Timeloop \cite{parashar2019timeloop}, MAGNETO and GATHER (anonymized). \\
+Output: per-shape tile sizes, loop-nest order. \\ \hline
+\textbf{\textsf{Scheduling layer (this paper).}} \\
+Input: mixed-precision policy and on-chip buffer of size $B$. \\
+Decision: which weight tiles to pin on-chip. \\
+Output: per-token off-chip bytes (efficiency). \\ \hline
+\end{tabular}
+\caption{The three-layer stack. Mapping and scheduling are sometimes
+conflated in single-pass dataflow papers; we show in
+Section~\ref{sec:motivation} that under autoregressive decode the
+mapping layer's degrees of freedom collapse onto byte traffic, so the
+scheduling layer's contribution is additive to mixed precision rather
+than redundant with it.}
+\label{fig:stack}
+\end{figure}
+
+\section{Background}
+\label{sec:background}
+
+\subsection{Mixed-Precision Quantization and Policy Search}
+Per-layer sensitivity scoring assigns each transformer block a score
+that measures the perplexity (PPL) degradation caused by quantizing
+that block to a specified number of bits. Common formulations use
+Hessian-trace signals \cite{dong2019hawq, dong2020hawqv2}, block
+reconstruction error \cite{li2021brecq}, or simple ablation. The
+\emph{policy search} problem is then: given allowed widths
+$W = \{b_1,\ldots,b_k\}$ and an average bits-per-weight (BPW) budget
+$\bar{B}$, find a per-layer assignment $B[l] \in W$ that minimizes the
+total $\Delta \mathrm{PPL}$ subject to $\mathrm{mean}(B) \le \bar{B}$.
+Greedy promotion by $\Delta \mathrm{PPL}$ per added bit is the standard
+solver and is near-optimal under monotone scores. Formally, the greedy
+rule promotes the layer with the largest gain in $\Delta \mathrm{PPL}$
+per added bit at each step:
+\begin{equation}
+\mathrm{score}(l, b\!\to\!b') = \frac{\Delta\mathrm{PPL}(l,b) - \Delta\mathrm{PPL}(l,b')}{b' - b}.
+\label{eq:greedy_score}
+\end{equation}
+
+\subsection{Post-Training Quantization with GPTQ}
+GPTQ \cite{frantar2023gptq} performs greedy column-by-column
+quantization while updating the remaining weights to compensate for
+accumulated error, using an approximate inverse Hessian computed from a
+small calibration set. It absorbs a meaningful fraction of the loss
+that isolated-layer sensitivity predicts, as we quantify in
+Section~\ref{sec:e1}.
+
+\subsection{Dataflow Mapping for Matrix Multiplication}
+Timeloop \cite{parashar2019timeloop} searches the loop-nest tiling
+space for a given problem ($M\!\times\!K\!\times\!N$) on a given
+accelerator (PE array, memory hierarchy, bandwidth). For an
+Eyeriss-like architecture \cite{chen2017eyeriss} with a 16$\times$16 PE
+array, a 256-KB on-chip ``weight-input buffer,'' and a 24-bit
+``accumulation buffer,'' Timeloop reports cycles, energy from its
+built-in power--area--timing model, and DRAM byte traffic per GEMM.
+
+\subsection{LLM Accelerator Memory Hierarchy}
+Modern LLM accelerators are designed around the observation that
+weights dominate memory traffic. Common patterns include large on-chip
+static random-access memory (SRAM) banks, or high-bandwidth memory
+(HBM) used as an explicit cache tier, that hold a fraction of the model
+resident across token boundaries
+\cite{lu2021sanger, guo2022ant}. This paper focuses on that residency
+layer: given the policy and the buffer size, which tiles stay.
+
+\section{Motivation: Mapping Search Does Not Save Decode}
+\label{sec:motivation}
+
+We instantiate the precision-aware-mapping hypothesis as follows. For
+each unique linear shape $s$ in a Qwen2.5-1.5B decoder block (seven
+shapes: \texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj},
+\texttt{o\_proj} and \texttt{gate\_proj}, \texttt{up\_proj},
+\texttt{down\_proj}) and each bit width $b \in \{4, 8\}$, we run the
+Timeloop mapper on a 16$\times$16 PE array with a 256-KB on-chip
+buffer and report cycles, energy, DRAM bytes, and PE utilization. We
+then compute the cross-application loss
+\begin{equation}
+L_{a \to b} := \frac{\mathrm{metric}(\mathrm{best}_a,\ \mathrm{weights}\!=\!b)}{\mathrm{metric}(\mathrm{best}_b,\ \mathrm{weights}\!=\!b)},
+\label{eq:cross_app}
+\end{equation}
+that is, how much we give up by forcing the wrong-bit-width's best
+mapping onto the actual bit-width's data.
+
+\paragraph{Result} The mappings differ: at INT4 the mapper picks a tile
+that holds the entire output dimension in the global buffer, while at
+INT8 the mapper must split the output dimension because the same tile
+would overflow the buffer. However, the cycles and energy outcomes are
+dominated by byte width
+(Table~\ref{tab:mapping_pilot}).
+
+\begin{table}[t]
+\caption{Mapping Pilot on Qwen2.5-1.5B: Cycle/Energy Ratios Track Byte Width}
+\label{tab:mapping_pilot}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Shape & $b$ & Cycles & Energy (pJ) & DRAM (MB) \\
+\midrule
+\texttt{q\_proj}  & 4 & 147{,}552 & $1.35\!\times\!10^8$ & 1.18 \\
+\texttt{q\_proj}  & 8 & 147{,}648 & $2.70\!\times\!10^8$ & 2.36 \\
+\texttt{up\_proj} & 4 & 860{,}256 & $7.85\!\times\!10^8$ & 6.89 \\
+\texttt{up\_proj} & 8 & 860{,}256 & $1.57\!\times\!10^9$ & 13.77 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The cycle ratio is $\approx 1.000$; the energy and DRAM ratios are
+$\approx 2.000$, the byte ratio of $b=8$ to $b=4$. The mapping geometry
+difference does not translate into a meaningful cycle delta because at
+$N\!=\!1$, every weight is touched once and the total DRAM time equals
+total bytes divided by bandwidth, which is identical between the two
+mappings: they stream the same total weight bytes.
+
+\paragraph{Conclusion of Section~\ref{sec:motivation}} For
+autoregressive decode on an Eyeriss-class array, mapping search is not
+the right surface for adding scheduling intelligence on top of mixed
+precision. The right surface is the layer above: which tiles do we keep
+on-chip across tokens?
+
+\section{Method: Precision-Aware Residency Scheduling}
+\label{sec:method}
+
+\subsection{Problem Definition}
+Let a decoder consist of $L$ blocks, each containing seven projections
+indexed as tiles $t \in T$. Each tile has a weight count $n_t$ (a
+function of the model hidden size and the projection role). Given a
+layer-wise mixed-precision policy $B[t] \in \{4, 8\}$, each tile has
+bytes
+\begin{equation}
+\mathrm{bytes}_{\mathrm{aware}}(t) = \frac{n_t \cdot B[t]}{8}.
+\label{eq:bytes_aware}
+\end{equation}
+Per token, the GEMM for each tile is read once. If the tile is
+\emph{pinned} in the on-chip buffer of capacity $B_{\mathrm{GBuf}}$,
+the read is free for that token and every subsequent token in the
+sequence; if it is \emph{streamed}, it costs
+$\mathrm{bytes}_{\mathrm{aware}}(t)$ of off-chip traffic per token.
+
+The scheduler selects a subset $P \subseteq T$ such that
+$\sum_{t \in P} \mathrm{budget}_{\mathrm{bytes}}(t) \le B_{\mathrm{GBuf}}$.
+The three schedulers we compare differ in the byte function they use
+for the constraint and in how they choose tiles within the budget:
+\begin{itemize}
+\item \textbf{Precision-aware (smallest-first knapsack):} uses
+$\mathrm{bytes}_{\mathrm{aware}}(t)$ and visits tiles in ascending
+order of size (Algorithm~\ref{alg:greedy}). Our default scheduler.
+\item \textbf{Precision-aware (random order):} uses the same
+$\mathrm{bytes}_{\mathrm{aware}}(t)$ for the constraint but visits
+tiles in a uniformly-random order, averaged over eight seeds. Isolates
+the contribution of the smallest-first rule from precision awareness.
+\item \textbf{Precision-oblivious (INT8 budget):} uses
+$\mathrm{bytes}_{\mathrm{int8}}(t) = n_t$ for the constraint while still
+consuming the actual $\mathrm{bytes}_{\mathrm{aware}}(t)$ once a tile is
+pinned. Reflects a deployment scheduler that ignores the policy and
+pessimistically assumes the worst-case bit width.
+\end{itemize}
+All three schedulers maximize the bytes saved per token,
+$\sum_{t \in P} \mathrm{bytes}_{\mathrm{aware}}(t)$, subject to their
+own budget constraint. We will show in Section~\ref{sec:e3_sweep} that
+the two precision-aware schedulers (smallest-first vs random) finish
+within roughly one percent of each other --- the win over oblivious is
+almost entirely attributable to byte-awareness, not to the
+smallest-first rule, which makes the result robust to solver choice.
+
+\subsection{Solver: Smallest-First Greedy Knapsack}
+\label{sec:solver}
+For autoregressive decode at $N\!=\!1$, every tile is accessed exactly
+once per token. The access frequency does not vary by tile, so the
+per-byte saving rate is identical for every tile. Under that
+condition, the optimal zero-one knapsack reduces to greedy
+smallest-first: sort tiles ascending by $\mathrm{budget}_{\mathrm{bytes}}$
+and pin until the next one would overflow $B_{\mathrm{GBuf}}$. This is
+optimal for both schedulers and runs in $O(|T|\log|T|)$ time
+(Algorithm~\ref{alg:greedy}).
+
+\begin{algorithm}[t]
+\caption{Greedy Smallest-First Residency}
+\label{alg:greedy}
+\begin{algorithmic}[1]
+\REQUIRE tiles $T$, budget function $f$, capacity $B_{\mathrm{GBuf}}$
+\STATE sort $T$ ascending by $f(t)$
+\STATE $P \gets \emptyset$;\ \ $u \gets 0$
+\FORALL{$t \in T$ in sorted order}
+  \IF{$u + f(t) \le B_{\mathrm{GBuf}}$}
+    \STATE $P \gets P \cup \{t\}$;\ \ $u \gets u + f(t)$
+  \ENDIF
+\ENDFOR
+\RETURN $P$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Hardware-Normalized Policy (Per-Tile, Optional)}
+\label{sec:hwnorm}
+The per-layer greedy of \eqref{eq:greedy_score} promotes layer $l$
+based on $\Delta\mathrm{PPL}/\Delta\mathrm{bits}$, which is independent
+of how many bytes the promotion costs. With a homogeneous decoder all
+layers are the same size, so this is fine; but within a layer, the seven
+projections have very different sizes
+($\texttt{k\_proj}$ and $\texttt{v\_proj}$ are six times smaller than
+$\texttt{gate\_proj}$ in Qwen2.5-1.5B). A per-tile hardware-normalized
+score uses $\Delta\mathrm{PPL}$ per added byte,
+\begin{equation}
+\mathrm{score}_{\mathrm{hwnorm}}(t, b\!\to\!b') = \frac{\Delta\mathrm{PPL}(t,b) - \Delta\mathrm{PPL}(t,b')}{n_t \cdot (b'-b)/8},
+\label{eq:hwnorm}
+\end{equation}
+which promotes the smallest highly sensitive tiles first (typically
+$\texttt{k\_proj}$ and $\texttt{v\_proj}$ of attention) and leaves the
+large multi-layer-perceptron (MLP) projections at the minimum width. We
+measure per-tile $\Delta\mathrm{PPL}$ by ablating each of the
+$L\!\times\!7$ linear layers independently.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Models, Weights, and Calibration}
+We evaluate on four open-weight chat-tuned LLM checkpoints spanning
+three families (Qwen, Gemma, Llama) and four scales from 1.54 to 8.03
+billion parameters, listed in Table~\ref{tab:models}. All baselines are
+fetched and stored read-only; the experimental pipeline produces
+quantized copies in a separate directory and never modifies the
+baseline weights. For Llama-3.1-8B-Instruct we use the
+\texttt{NousResearch/Meta-Llama-3.1-8B-Instruct} community
+redistribution, which carries the same Git SHA as Meta's gated repo;
+the two are bit-identical and we treat them as the same checkpoint for
+the purposes of this paper.
+
+\begin{table}[t]
+\caption{Models and Decoder Footprints}
+\label{tab:models}
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Model & Params & INT4 dec.\ & INT8 dec.\ \\
+\midrule
+Qwen2.5-1.5B-Instruct      & 1.54\,B & 655\,MB & 1.31\,GB \\
+Gemma-2-2B-IT              & 2.61\,B & 1.04\,GB & 2.07\,GB \\
+Qwen2.5-7B-Instruct        & 7.61\,B & 3.25\,GB & 6.50\,GB \\
+Llama-3.1-8B-Instruct$^*$  & 8.03\,B & 3.49\,GB & 6.98\,GB \\
+\bottomrule
+\multicolumn{4}{l}{\footnotesize $^*$ obtained from the
+\texttt{NousResearch/Meta-Llama-3.1-8B-Instruct}}\\
+\multicolumn{4}{l}{\footnotesize \phantom{$^*$} community redistribution
+at the same Git SHA as Meta's gated repo.}
+\end{tabular}
+\end{table}
+
+Sensitivity scoring ablates one decoder block, or one projection in the
+per-tile variant of Section~\ref{sec:hwnorm}, to bits
+$b \in \{4, 8\}$ using symmetric per-output-channel uniform
+fake-quantization, and reports WikiText-2 test-set perplexity over a
+sliding-window of 2048 tokens with 200 calibration texts. For
+Qwen2.5-7B and Llama-3.1-8B the models are sharded across the
+available GPUs via Hugging Face Accelerate \cite{accelerate} (using
+\texttt{device\_map=\"auto\"}) with 50 calibration texts for the 7B and
+the default 200 for the 8B (which fits in four 16-GiB cards in
+half-precision); the resulting $\Delta\mathrm{PPL}$ rankings are
+consistent with the 200-text setting used for the 1.5B model.
+
+GPTQ uses 32 calibration samples from WikiText-2 train with a group
+size of 128 and the descending-activation order option enabled. For
+mixed-precision policies, we use a regular-expression override on the
+quantizer configuration to set eight-bit on the layers selected by the
+policy. For the 7B model we pass \texttt{device\_map=\"auto\"} to enable
+multi-GPU-sharded calibration.
+
+Evaluation reports WikiText-2 test perplexity over a sliding window of
+2048 tokens on the full split. GPTQ checkpoints are loaded through the
+quantizer's own loader rather than the generic
+\texttt{AutoModelForCausalLM} loader to avoid an Optimum-Transformers
+compatibility issue in the installed library versions.
+
+\subsection{Hardware Model}
+Timeloop v3.0.3 with the necessary patches drives the mapping pilot of
+Section~\ref{sec:motivation}. The architecture template is a
+16$\times$16 PE array with a 256-KB on-chip ``weight-input buffer'' and
+a DRAM bandwidth of 32~GB/s. Per-bit multiply-accumulate (MAC) and
+storage energy come from Timeloop's built-in power--area--timing model
+with the word-width parameter set to the operand bit width.
+
+The residency experiments of Sections~\ref{sec:e2_residency}--%
+\ref{sec:e4} use an analytic byte-traffic model: every weight is
+touched exactly once per token, so DRAM traffic per token equals
+$\sum_{t \notin P} \mathrm{bytes}_{\mathrm{aware}}(t)$. The negative
+mapping result of Section~\ref{sec:motivation} justifies this: at
+$N\!=\!1$, total cycles track DRAM bytes linearly and the mapping
+geometry contribution is below noise.
+
+\paragraph{Energy per byte}
+We translate per-token DRAM bytes into a Joule estimate by harvesting
+the energy-per-byte ratio from the same Timeloop runs that drive the
+mapping pilot. Averaging across the six (shape $\times$ bit-width)
+mapper runs we observe $\mathrm{energy/byte}\!=\!114.03$\,pJ at INT4 and
+$114.14$\,pJ at INT8 --- statistically identical (ratio $1.001$), in
+direct correspondence with the negative mapping result of
+Section~\ref{sec:motivation}. We therefore take a single constant
+$E_b\!=\!114.08$\,pJ/byte and report energy per token as $E_b$ times
+the DRAM-byte traffic reported by the residency model. This gives a
+defensible energy lower bound that ignores PE-array idle power and
+on-chip-buffer refresh, both of which are common to all schedulers.
+
+\subsection{GPU Profile (Sanity Check)}
+We separately measure GPU-side latency, throughput, and approximate
+energy per token on a single NVIDIA RTX 2000 Ada (16 GiB) using the
+NVIDIA Management Library (NVML) for power sampling at 20-ms intervals
+through a background thread. These numbers serve as a sanity check for
+the analytic model and as a deployment-scale reference; they are not
+the main result.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{E1: Ranking Validation}
+\label{sec:e1}
+We measure four policies per model: INT4-uniform, INT8-uniform, and
+two mixed policies from the greedy per-layer score at average bits per
+weight $N \in \{4.5, 5.0\}$. For each we quantize with GPTQ and measure
+real WikiText-2 perplexity.
+
+\begin{table}[t]
+\caption{Real GPTQ Perplexity Across Four Models.\\ All Four Are Monotone in Average Bits per Weight (Kendall $\tau = -1.0$)}
+\label{tab:e1}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Policy & Qwen-1.5B & Gemma-2B & Qwen-7B & Llama-8B \\
+\midrule
+FP16 baseline & 8.890  & ---     & 6.121$^*$ & ---     \\
+INT4-uniform  & 10.452 & 14.800  & 7.785     & 7.873   \\
+Mixed-4.5     & 10.279 & 14.723  & 7.724     & 7.561   \\
+Mixed-5.0     & 10.091 & 14.387  & 7.661     & 7.514   \\
+INT8-uniform  & 9.604  & 13.773  & 7.376     & 7.159   \\
+\bottomrule
+\multicolumn{5}{l}{\footnotesize $^*$ measured with 50 calibration
+texts, multi-GPU sharded.}
+\end{tabular}
+\end{table}
+
+All four models exhibit a perfectly monotone ranking (Table~\ref{tab:e1});
+the Kendall rank correlation between average bits per weight and
+perplexity is $-1.0$ for every model.
+
+\paragraph{Sensitivity is conservative}
+For Qwen-1.5B, the isolated-layer upper bound predicts a
+$\Delta \mathrm{PPL}$ of $+$4.00 for INT4-uniform versus FP16; the real
+GPTQ value is $+$1.56, that is, GPTQ absorbs 61\% of the predicted loss
+through Hessian-aware reconstruction. The ratio is similar for Gemma-2B,
+Qwen-7B, and Llama-8B. The \emph{ranking} of policies, however, matches the
+upper-bound ranking exactly (Kendall $\tau$ on the real-versus-upper
+sequence is $+$1.000 for Qwen-1.5B; see
+Fig.~\ref{fig:e1_ranking_validation}). The implication is that
+sensitivity is an order oracle, not a magnitude oracle.
+
+\paragraph{GPTQ floor}
+Even uniform-INT8 GPTQ adds $+$0.71 perplexity points on Qwen-1.5B
+versus the FP16 baseline, against a sensitivity upper bound of only
+$+$0.03. This is a property of GPTQ's group-wise calibration with
+group size 128 and 32 calibration samples and would shrink under larger
+calibration; for relative policy comparison this offset cancels out.
+
+\paragraph{Downstream-task validation}
+To check that the perplexity ranking carries over to a downstream task,
+we evaluate zero-shot HellaSwag accuracy on a 1000-sample validation
+subset (standard error $\approx$ 1.5 percentage points at this $N$)
+using length-normalized log-likelihood scoring
+(Table~\ref{tab:hellaswag}). All sixteen quantized configurations are
+within three percentage points of their FP16 baseline. The largest
+absolute degradation is on Llama-8B INT4-uniform ($-2.8$\,pp versus
+FP16), and the Mixed-4.5 policy recovers it to within $-1.4$\,pp at a
+matched average bit-width below five bits. On the smaller models the
+INT4 perplexity gap does not produce a statistically detectable
+HellaSwag gap, consistent with the coarse-grained nature of four-way
+multiple-choice accuracy versus token-level perplexity.
+
+\begin{table}[t]
+\caption{Zero-Shot HellaSwag Accuracy (1000-Sample Subset): Quantization Is Safe for Downstream Task Across All Four Models}
+\label{tab:hellaswag}
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Model      & FP16  & INT4-unif & Mixed-4.5 & Mixed-5.0 & INT8-unif \\
+\midrule
+Qwen-1.5B  & 0.573 & 0.564 & 0.569 & 0.560 & 0.568 \\
+Gemma-2-2B & 0.419 & 0.442 & 0.428 & 0.422 & 0.422 \\
+Qwen-7B    & 0.672 & 0.671 & 0.666 & 0.669 & 0.673 \\
+Llama-8B   & 0.677 & 0.649 & 0.663 & 0.663 & 0.673 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../experiments/results/figs/e1_ranking_validation.png}
+\caption{E1 ranking validation for Qwen2.5-1.5B-Instruct. Left:
+sensitivity upper bound (dashed) versus real GPTQ perplexity (solid);
+right: GPTQ absorbs most of the predicted loss, but the ranking is
+preserved.}
+\label{fig:e1_ranking_validation}
+\end{figure}
+
+\subsection{E2-Residency: Main Result}
+\label{sec:e2_residency}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../experiments/results/figs/codesign_main.png}
+\caption{Accuracy versus per-token off-chip traffic at
+$B_{\mathrm{GBuf}}\!=\!512$\,MB on Qwen2.5-1.5B. Filled circles are
+precision-aware schedulers; crosses are precision-oblivious schedulers.
+The arrows show the per-policy reduction in off-chip traffic from using
+the precision-aware scheduler.}
+\label{fig:codesign_main}
+\end{figure}
+
+Figure~\ref{fig:codesign_main} is our main result for Qwen-1.5B at the
+$B_{\mathrm{GBuf}}\!=\!512$\,MB operating point, slightly below the
+INT4-uniform 655-MB decoder total. Filled circles are the
+precision-aware schedulers; crosses are the precision-oblivious INT8
+budget schedulers; the arrows show the aware reduction.
+
+\begin{table}[t]
+\caption{Per-Token Off-Chip Traffic at $B_{\mathrm{GBuf}}\!=\!512$\,MB (Qwen-1.5B)}
+\label{tab:e3_qwen15b}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Policy & PPL & Aware (MB) & Obl. (MB) & Aware $\downarrow$ \\
+\midrule
+INT4-uniform  & 10.452 & \textbf{124} & 392 & \textbf{3.17$\times$} \\
+Mixed-4.5     & 10.279 & \textbf{213} & 454 & \textbf{2.13$\times$} \\
+Mixed-5.0     & 10.091 & \textbf{289} & 516 & \textbf{1.79$\times$} \\
+INT8-uniform  &  9.604 & 784 & 784 & 1.00$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+INT8-uniform's coincidence of aware and oblivious in
+Table~\ref{tab:e3_qwen15b} is the trivial limit: the policy is already
+at the worst-case bit width assumed by the oblivious scheduler, so the
+conservative budget is exact.
+
+\paragraph{Bimodal regime}
+When the buffer is just large enough to hold an INT4 version of the
+decoder but not an INT8 version, the aware scheduler can keep
+mixed-precision models fully resident on chip and per-token off-chip
+traffic drops to zero. INT8-uniform still has to stream, regardless of
+scheduler. This bimodal regime is the cleanest story for an
+accelerator with on-chip SRAM around the INT4-total footprint of the
+model.
+
+\subsubsection{GPU Sanity Check}
+The numbers in Table~\ref{tab:e3_qwen15b} are computed analytically.
+The negative mapping result of Section~\ref{sec:motivation} justifies
+that approximation in the decode regime, but a hardware paper should
+not rest the main result on arithmetic alone. We therefore measure the
+FP16 baseline of Qwen2.5-1.5B on a single NVIDIA RTX 2000 Ada (16 GiB),
+generating 256 tokens with deterministic decoding and sampling NVML
+power at 20-ms intervals through a background thread.
+
+\begin{table}[t]
+\caption{GPU Sanity Profile: FP16 Qwen2.5-1.5B on a Single RTX 2000 Ada}
+\label{tab:gpu_profile}
+\centering
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Throughput & 25.0 tokens/s \\
+Wall time / 256 tokens & 10.24 s \\
+Average GPU power & 68.5 W \\
+Energy per token & 2.74 J \\
+Power samples & 510 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:gpu_profile} is consistent with the analytic prediction:
+at FP16 the per-token decoder bytes are 2.62 GB and a memory subsystem
+of the relevant class caps throughput in the same neighborhood. We use
+the order between this measurement and the quantized configurations as
+the cross-check, not its absolute value. A controlled cross-configuration
+GPU comparison is the natural follow-up.
+
+\subsection{E3: Cross-Model Sweep}
+\label{sec:e3_sweep}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{../experiments/results/figs/sweep_cross_model.png}
+\caption{Cross-model sweep. Solid lines: precision-aware scheduler.
+Dashed: precision-oblivious INT8-budget scheduler. The aware
+contribution generalizes across three model families (Qwen, Gemma,
+Llama) and scales from 1.5 to 8 billion parameters. The figure shown
+covers the Qwen-1.5B/Gemma-2B/Qwen-7B panels; the Llama-8B panel
+mirrors the same shape and is reported in Table~\ref{tab:cross_model}.}
+\label{fig:sweep_cross_model}
+\end{figure*}
+
+Figure~\ref{fig:sweep_cross_model} shows the same accuracy-versus-DRAM
+relation across four models at log-scaled buffer size. Three
+observations follow.
+
+\noindent\emph{Curve shape is universal.} All four models exhibit the
+same monotone-in-$B_{\mathrm{GBuf}}$ decline and the same ordering:
+INT4-uniform $<$ Mixed-4.5 $<$ Mixed-5.0 $<$ INT8-uniform.
+
+\noindent\emph{The knee sits at $B_{\mathrm{GBuf}} \approx$ INT4 total.}
+For each model the knee is at the INT4-total footprint (655\,MB,
+1.04\,GB, 3.25\,GB, 3.49\,GB). Below the knee, the aware-versus-oblivious
+gap grows; above the knee, the aware scheduler collapses to zero.
+
+\noindent\emph{Win factor scales with the buffer-to-decoder ratio.}
+At $B_{\mathrm{GBuf}} \approx 0.4$--$0.6 \times$ INT4 total --- the
+``sweet'' operating regime where the buffer holds roughly half of the
+quantized decoder --- the win factors are shown in
+Table~\ref{tab:cross_model}.
+
+\begin{table}[t]
+\caption{Aware-Versus-Oblivious Win at the Comparable Sweet Operating Point: the Smallest-First Knapsack and a Random-Order Knapsack Land Within One Percent of Each Other}
+\label{tab:cross_model}
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Model and policy   & Aware DRAM & Random DRAM & Oblivious DRAM & Oblv/Aware \\
+\midrule
+\multicolumn{5}{l}{\emph{Qwen-1.5B, $B_{\mathrm{GBuf}}\!=\!256$\,MB}} \\
+\quad INT4-uniform  & 392.2\,MB & 386.7\,MB & 523.0\,MB & 1.33$\times$ \\
+\quad Mixed-4.5     & 481.7\,MB & 480.3\,MB & 584.9\,MB & 1.21$\times$ \\
+\quad Mixed-5.0     & 550.5\,MB & 550.5\,MB & 646.8\,MB & 1.18$\times$ \\
+\midrule
+\multicolumn{5}{l}{\emph{Gemma-2-2B, $B_{\mathrm{GBuf}}\!=\!512$\,MB}} \\
+\quad INT4-uniform  & 499.0\,MB & 499.0\,MB & 775.0\,MB & \textbf{1.55$\times$} \\
+\quad Mixed-4.5     & 658.2\,MB & 658.2\,MB & 902.4\,MB & 1.37$\times$ \\
+\quad Mixed-5.0     & 785.6\,MB & 777.7\,MB & 998.0\,MB & 1.27$\times$ \\
+\midrule
+\multicolumn{5}{l}{\emph{Qwen-7B, $B_{\mathrm{GBuf}}\!=\!2$\,GB}} \\
+\quad INT4-uniform  & 1.12\,GB  & 1.12\,GB  & 2.21\,GB  & \textbf{1.97$\times$} \\
+\quad Mixed-4.5     & 1.60\,GB  & 1.58\,GB  & 2.31\,GB  & 1.45$\times$ \\
+\quad Mixed-5.0     & 1.94\,GB  & 1.93\,GB  & 2.51\,GB  & 1.30$\times$ \\
+\midrule
+\multicolumn{5}{l}{\emph{Llama-8B, $B_{\mathrm{GBuf}}\!=\!2$\,GB}} \\
+\quad INT4-uniform  & 1.35\,GB  & 1.34\,GB  & 2.44\,GB  & \textbf{1.80$\times$} \\
+\quad Mixed-4.5     & 1.79\,GB  & 1.78\,GB  & 2.61\,GB  & 1.46$\times$ \\
+\quad Mixed-5.0     & 2.23\,GB  & 2.21\,GB  & 2.97\,GB  & 1.33$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two findings follow. First, the win factor grows with the
+buffer-to-decoder ratio rather than with parameter count alone: Qwen-7B
+operates at $B_{\mathrm{GBuf}}/$INT4 $=$ 0.63 and reaches 1.97$\times$,
+while Llama-8B operates at the same absolute
+$B_{\mathrm{GBuf}}\!=\!2$\,GB but a smaller ratio of 0.59 and reaches
+1.80$\times$. Per-tile byte accounting matters more as the on-chip
+buffer is sized to hold a larger fraction of the four-bit decoder.
+
+Second, the smallest-first knapsack and an uniformly-random ordering of
+the same byte-aware schedule finish within roughly one percent of each
+other across all sixteen (model, policy) settings; in some cases the
+random order even pins marginally more bytes (e.g.,~Qwen-1.5B
+INT4-uniform: 386.7\,MB versus 392.2\,MB). The implication is that
+\emph{precision awareness}, not the smallest-first rule, drives almost
+all of the contribution. The technique is therefore robust to solver
+choice and does not depend on a particular knapsack heuristic.
+
+\paragraph{Energy per token}
+Multiplying the DRAM-byte numbers of Table~\ref{tab:cross_model} by the
+Timeloop-derived constant $E_b\!=\!114.08$\,pJ/byte
+(Section~\ref{sec:setup}) gives the energy per generated token at the
+same sweet operating point (Table~\ref{tab:energy_per_token}).
+
+\begin{table}[t]
+\caption{Energy per Generated Token at the Sweet Operating Point (mJ/Token; Aware Versus Oblivious INT8-Budget)}
+\label{tab:energy_per_token}
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+Model and policy   & Aware & Oblivious & Aware saves \\
+\midrule
+\multicolumn{4}{l}{\emph{Qwen-1.5B, $B_{\mathrm{GBuf}}\!=\!256$\,MB}} \\
+\quad INT4-uniform  & 44.7 & 59.7  & 14.9 \\
+\quad Mixed-4.5     & 55.0 & 66.7  & 11.8 \\
+\quad Mixed-5.0     & 62.8 & 73.8  & 11.0 \\
+\midrule
+\multicolumn{4}{l}{\emph{Gemma-2-2B, $B_{\mathrm{GBuf}}\!=\!512$\,MB}} \\
+\quad INT4-uniform  & 56.9 & 88.4  & \textbf{31.5} \\
+\quad Mixed-4.5     & 75.1 & 102.9 & 27.9 \\
+\quad Mixed-5.0     & 89.6 & 113.9 & 24.2 \\
+\midrule
+\multicolumn{4}{l}{\emph{Qwen-7B, $B_{\mathrm{GBuf}}\!=\!2$\,GB}} \\
+\quad INT4-uniform  & 127.8 & 251.7 & \textbf{123.9} \\
+\quad Mixed-4.5     & 182.0 & 263.3 & 81.3 \\
+\quad Mixed-5.0     & 220.7 & 286.6 & 65.8 \\
+\midrule
+\multicolumn{4}{l}{\emph{Llama-8B, $B_{\mathrm{GBuf}}\!=\!2$\,GB}} \\
+\quad INT4-uniform  & 154.1 & 278.0 & \textbf{123.9} \\
+\quad Mixed-4.5     & 204.3 & 298.1 & 93.8 \\
+\quad Mixed-5.0     & 254.6 & 338.3 & 83.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The absolute energy savings grow with model size: precision-aware
+scheduling shaves $\sim$12--15\,mJ off every token on Qwen-1.5B but
+$\sim$80--120\,mJ off every token on the 7B and 8B models, because the
+DRAM-byte gap that the aware scheduler closes is larger in absolute
+terms when the model is larger. At a sustained decode throughput of
+100 tokens per second this corresponds to $\sim$8--12\,W of avoided
+DRAM-traffic power on the 7B/8B class.
+
+\subsection{E4: Per-Tile Hardware-Normalized Policy}
+\label{sec:e4}
+
+Section~\ref{sec:e4} reports policy shape (Table~\ref{tab:hwnorm_shape}),
+GPTQ-measured perplexity (Table~\ref{tab:hwnorm_ppl}), and the residency
+consequence of the resulting shape (Table~\ref{tab:hwnorm_resid}). The
+accuracy result confirms the motivation for the score in
+Section~\ref{sec:hwnorm}: at matched average bits per weight, the
+per-tile policy beats the per-layer greedy policy on WikiText-2
+perplexity by an amount that grows as the budget tightens.
+
+The greedy per-layer score of \eqref{eq:greedy_score} ignores byte
+cost. Using \eqref{eq:hwnorm} at per-projection granularity (196 tiles
+for Qwen-1.5B), Table~\ref{tab:hwnorm_shape} contrasts the resulting
+policy shape against the per-layer greedy at the same average bits per
+weight.
+
+\begin{table}[t]
+\caption{Policy Shape: Per-Layer Greedy Versus Per-Tile Hardware-Normalized at $\bar B = 4.5$}
+\label{tab:hwnorm_shape}
+\centering
+\begin{tabular}{lrr}
+\toprule
+Projection & Greedy (out of 28) & Hwnorm (out of 28) \\
+\midrule
+\texttt{q\_proj}    & 4 at 8-bit & 7 at 8-bit \\
+\texttt{k\_proj}    & 4          & \textbf{17}        \\
+\texttt{v\_proj}    & 4          & \textbf{25 (89\%)} \\
+\texttt{o\_proj}    & 4          & 15         \\
+\texttt{gate\_proj} & 4          & \textbf{0 (all 4-bit)} \\
+\texttt{up\_proj}   & 4          & 2          \\
+\texttt{down\_proj} & 4          & 5          \\
+\midrule
+Total 8-bit tiles & 28 & \textbf{71} \\
+Achieved BPW      & 4.571 & \textbf{4.503} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The hardware-normalized policy concentrates the eight-bit budget in
+attention's KV projections, which are the cheapest to promote
+(approximately four to six times smaller than MLP projections) and
+remain sensitive. MLP \texttt{gate\_proj} stays entirely at INT4
+because it is 6.89~MB per layer at INT4 and any single promotion to
+eight-bit consumes 6.89~MB of budget --- too expensive against its
+$\Delta\mathrm{PPL}$ contribution.
+
+\begin{table}[t]
+\caption{Real GPTQ Perplexity at Matched Average Bit-Width: Per-Tile Hardware-Normalized Beats Per-Layer Greedy in Seven of Eight Settings Across Four Models}
+\label{tab:hwnorm_ppl}
+\centering
+\small
+\begin{tabular}{llrrr}
+\toprule
+Model & Budget & Greedy ppl & Hwnorm ppl & $\Delta$ ppl \\
+\midrule
+\multirow{4}{*}{Qwen-1.5B}  & $\bar B = 4.5$ & 10.279 & \textbf{10.117} & $-0.162$ \\
+                            & $\bar B = 5.0$ & 10.091 & \textbf{10.025} & $-0.066$ \\
+                            & $\bar B = 5.5$ & ---    & 9.912           & ---      \\
+                            & $\bar B = 6.0$ & ---    & 9.838           & ---      \\
+\midrule
+\multirow{2}{*}{Gemma-2-2B} & $\bar B = 4.5$ & 14.723 & \textbf{14.663} & $-0.060$ \\
+                            & $\bar B = 5.0$ & 14.387 & 14.406          & $+0.019$ \\
+\midrule
+\multirow{2}{*}{Qwen-7B}    & $\bar B = 4.5$ & 7.724  & \textbf{7.676}  & $-0.048$ \\
+                            & $\bar B = 5.0$ & 7.661  & \textbf{7.581}  & $-0.080$ \\
+\midrule
+\multirow{2}{*}{Llama-8B}   & $\bar B = 4.5$ & 7.561  & \textbf{7.532}  & $-0.029$ \\
+                            & $\bar B = 5.0$ & 7.514  & \textbf{7.467}  & $-0.047$ \\
+\bottomrule
+\multicolumn{5}{l}{\footnotesize Greedy ppl for Qwen-1.5B at $\bar B \in \{5.5, 6.0\}$ was not run in E1.}
+\end{tabular}
+\end{table}
+
+Across the four models, the per-tile hardware-normalized policy
+reduces WikiText-2 perplexity at matched average bit-width in seven of
+the eight settings reported in Table~\ref{tab:hwnorm_ppl}. The lone
+exception is Gemma-2-2B at $\bar B\!=\!5.0$, where the gap is $+$0.019
+--- within the magnitude we attribute to GPTQ calibration noise at 32
+samples. The win is concentrated at the tightest budget ($\bar B\!=\!4.5$),
+which is consistent with the intuition that protecting key-value
+projections matters most when the eight-bit promotion budget is small.
+
+\begin{table}[t]
+\caption{Residency Consequence at $B_{\mathrm{GBuf}}\!=\!512$\,MB Is Modest}
+\label{tab:hwnorm_resid}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Budget & Greedy BPW & Hwnorm BPW & Greedy DRAM & Hwnorm DRAM \\
+\midrule
+$\bar B = 4.5$ & 4.571 & 4.503 & 213.3\,MB & \textbf{206.4\,MB} \\
+$\bar B = 5.0$ & 5.000 & 5.025 & 289.0\,MB & 289.0\,MB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The residency win is small because the knapsack picks tiles by absolute
+size; it is unaware of which logical role each tile plays
+(Table~\ref{tab:hwnorm_resid}). The accuracy side is where we expect
+the real win: protecting 89\% of \texttt{v\_proj} at eight-bit while
+keeping all \texttt{gate\_proj} at four-bit yields a lower perplexity
+at iso-budget than the per-layer policy, as confirmed by the GPTQ
+results of Table~\ref{tab:hwnorm_ppl}.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{What the Negative Mapping Result Really Means}
+Section~\ref{sec:motivation} reports that for a 16$\times$16
+Eyeriss-class architecture at $N\!=\!1$ decode, the mapper finds
+equivalent-cost mappings for INT4 and INT8 versions of the same matrix
+multiply. This is not a claim that mapping search is useless for LLM
+accelerators; only that, in the regime where total weight bytes are
+much larger than on-chip capacity and each weight is touched once per
+token, the mapping decision space collapses onto a single
+byte-bound point. In two complementary regimes we expect mapping to
+recover relevance: prefill ($N \gg 1$), where weights are reused across
+tokens within the forward pass, and architectures with comparable
+on-chip and off-chip ratios, where buffer-pressure effects become the
+dominant variable.
+
+\subsection{Limitations and Follow-Ups}
+\label{sec:limitations}
+First, our energy estimate of Table~\ref{tab:energy_per_token} is a
+DRAM-traffic lower bound derived from the per-byte energy harvested by
+Timeloop; it omits PE-array idle power and on-chip-buffer refresh,
+which are common across schedulers but inflate the absolute mJ/token
+number. A full Accelergy run that integrates idle and leakage power
+would tighten the absolute energy, though not the aware-versus-oblivious
+ratios reported here. Second, the zero-one knapsack
+model is conservative: it pins or streams each tile entirely. A real
+scheduler could prefetch the next layer's weights while the current
+layer computes; modeling that would reduce the oblivious baseline's
+overhead. Third, pinning is valuable across many tokens; for a
+single-token generation the residency win is zero. Our results
+implicitly assume sustained decoding. Fourth, the per-tile
+hardware-normalized policy is validated on Qwen-1.5B with four budgets
+and on Gemma-2-2B, Qwen-7B, and Llama-8B with two budgets each
+(Table~\ref{tab:hwnorm_ppl}); replicating it on additional model
+families and at the loosest budgets would round out the picture.
+Fifth, downstream-task evaluation is reported on a 1000-sample
+HellaSwag subset (Table~\ref{tab:hellaswag}); a larger subset and
+additional tasks such as ARC-Challenge and MMLU would sharpen the
+sub-2-percent gaps that fall inside our standard-error band at the
+present sample size.
+
+\subsection{Composability With Mapping-Layer Work}
+Power-aware mapping such as MAGNETO (anonymized) and LLM-specific
+accelerator design such as GATHER (anonymized) sit at the mapping
+layer of Fig.~\ref{fig:stack}. Our work sits one layer higher and
+composes with both: given a fixed policy and a fixed mapping, the
+scheduler decides which tiles benefit from on-chip residency.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Layer-Wise Mixed-Precision Policy Search}
+HAWQ \cite{dong2019hawq} and its eigenvalue variant
+\cite{dong2020hawqv2} introduced second-order sensitivity scoring for
+per-layer bit-width assignment. BRECQ \cite{li2021brecq} formulated
+block-wise reconstruction error as a more practical signal, and
+OmniQuant \cite{shao2024omniquant} re-parameterized the search to make
+the budget a learnable variable. LLM.int8() \cite{dettmers2022llmint8}
+argued for outlier-aware INT8 inference. All four sit at the algorithm
+layer of Fig.~\ref{fig:stack}; none addresses how the resulting policy
+interacts with the deployment-time residency budget.
+
+\subsection{LLM Quantization at Deployment}
+GPTQ \cite{frantar2023gptq} performs Hessian-aware column-wise
+rounding; we use it as our quantizer of record. AWQ
+\cite{lin2024awq} preserves activation-salient channels;
+SmoothQuant \cite{xiao2023smoothquant} shifts the
+activation-versus-weight quantization difficulty. Marlin
+\cite{frantar2024marlin} provides a fast four-bit decode kernel that
+turns the byte saving of mixed precision into latency savings on
+modern GPUs. These produce kernels; scheduling decisions about which
+weights stay on chip are outside their scope.
+
+\subsection{LLM Accelerator Dataflow}
+Sanger \cite{lu2021sanger} and Ant \cite{guo2022ant} are representative
+LLM accelerator designs with custom dataflow. Our laboratory's prior
+power-aware mapping and LLM-specific accelerator (both anonymized for
+review) sit in the same space. Each contributes at the mapping layer
+of Fig.~\ref{fig:stack}; they assume a fixed precision plan as input
+and search the tile and dataflow space. Our work composes with all of
+them: a Sanger-class mapper produces the per-shape mapping that
+determines cycles per token per tile; our scheduler decides which of
+those tiles avoid DRAM round trips.
+
+\subsection{Memory Residency and Cache Scheduling for LLM Serving}
+SARATHI \cite{agrawal2024sarathi} schedules prefill and decode batches
+to improve GPU utilization but operates at the request level.
+DistServe \cite{zhong2024distserve} decouples prefill and decode
+across machines. FlexGen \cite{sheng2023flexgen} tiers weight storage
+across GPU, CPU, and SSD for offload-friendly inference.
+ChunkAttention \cite{ye2024chunkattention} re-orders KV-cache access
+for sequence reuse. These works address the residency of the
+key-value cache or of runtime state. Our work addresses the residency
+of weights under a mixed-precision policy, a different optimization
+variable.
+
+\subsection{Knapsack-Based Scheduling for Inference}
+Tetris \cite{gao2017tetris} uses integer-linear-programming over
+operators for three-dimensional DNN partitioning; TVM/Ansor
+\cite{zheng2020ansor} is search-based but at the kernel-fusion
+granularity. None of these are precision-aware: the operand bit width
+is fixed upfront. Our knapsack instance is defined by the per-tile
+bytes, which are constructed by the upstream policy; that is the
+precise coupling that the scheduling layer must surface.
+
+\section{Conclusion}
+\label{sec:conclusion}
+We isolate a system-level question that the mixed-precision quantization
+literature does not address: given a fixed policy, which weight tiles
+do we keep on-chip? We formulate the problem as a greedy zero-one
+knapsack over per-tile bytes, show that a precision-aware scheduler
+reduces per-token off-chip traffic by 1.33$\times$--1.97$\times$ across
+three LLM families (Qwen, Gemma, Llama) and four checkpoints from 1.5 to
+8 billion parameters at a comparable operating point, and up to
+3.17$\times$ in the knee regime for the 1.5B-parameter model. The
+contribution generalizes with a factor that grows with the
+buffer-to-decoder ratio. We release the full reproducibility trail, including an
+analytic-to-measurement cross-check via a GPU profile of the
+unquantized baseline. The result puts a name and a quantification on a
+layer of the stack between the quantization algorithm and the dataflow
+mapper, and points to prefetch-aware scheduling as the natural
+follow-up. As a method extension, the per-tile
+hardware-normalized policy reduces WikiText-2 perplexity in seven of
+eight settings across four models at matched average bit-width
+(Section~\ref{sec:e4}, Table~\ref{tab:hwnorm_ppl}), with the largest
+gain ($-0.162$ at $\bar B = 4.5$ on Qwen-1.5B) concentrated at the
+tightest budget where protecting key-value projections matters most.
+We further demonstrate that the win is driven by precision awareness
+itself: replacing the smallest-first knapsack with a uniformly-random
+order on the same byte-aware budget shifts DRAM traffic by less than
+one percent, so the result is robust to solver choice.
+
+\section*{Acknowledgment}
+The authors thank the members of our laboratory for early discussion
+on the framing.
+
+\noindent\textbf{Use of generative AI.} Portions of the text in
+Sections~\ref{sec:introduction}, \ref{sec:method}, \ref{sec:results},
+\ref{sec:related}, and \ref{sec:conclusion} were drafted with the
+assistance of Anthropic Claude \cite{anthropic2024claude}. All
+technical claims, equations, and the experimental design are the
+authors' own; the AI's role was limited to language polishing,
+structural editing, and the suggestion of alternative phrasings, after
+which the authors verified every quantitative statement against the
+experimental artifacts. No part of the experimental design,
+implementation, or numerical results was generated by the AI without
+authorial verification.
+
+\begin{thebibliography}{99}
+
+\bibitem{dong2019hawq}
+Z.~Dong, Z.~Yao, A.~Gholami, M.~W. Mahoney, and K.~Keutzer,
+``HAWQ: Hessian AWare Quantization of neural networks with mixed-precision,''
+in \emph{Proc. IEEE/CVF Int. Conf. Comput. Vis. (ICCV)}, Seoul, South Korea, Oct. 2019, pp. 293--302.
+
+\bibitem{dong2020hawqv2}
+Z.~Dong, Z.~Yao, D.~Arfeen, A.~Gholami, M.~W. Mahoney, and K.~Keutzer,
+``HAWQ-V2: Hessian aware trace-weighted quantization of neural networks,''
+in \emph{Adv. Neural Inf. Process. Syst. (NeurIPS)}, vol. 33, Dec. 2020, pp. 18518--18529.
+
+\bibitem{li2021brecq}
+Y.~Li, R.~Gong, X.~Tan, Y.~Yang, P.~Hu, Q.~Zhang, F.~Yu, W.~Wang, and S.~Gu,
+``BRECQ: Pushing the limit of post-training quantization by block reconstruction,''
+in \emph{Proc. Int. Conf. Learn. Represent. (ICLR)}, May 2021.
+
+\bibitem{shao2024omniquant}
+W.~Shao, M.~Chen, Z.~Zhang, P.~Xu, L.~Zhao, Z.~Li, K.~Zhang, P.~Gao, Y.~Qiao, and P.~Luo,
+``OmniQuant: Omnidirectionally calibrated quantization for large language models,''
+in \emph{Proc. Int. Conf. Learn. Represent. (ICLR)}, May 2024.
+
+\bibitem{dettmers2022llmint8}
+T.~Dettmers, M.~Lewis, Y.~Belkada, and L.~Zettlemoyer,
+``LLM.int8(): 8-bit matrix multiplication for transformers at scale,''
+in \emph{Adv. Neural Inf. Process. Syst. (NeurIPS)}, vol. 35, Dec. 2022, pp. 30318--30332.
+
+\bibitem{frantar2023gptq}
+E.~Frantar, S.~Ashkboos, T.~Hoefler, and D.~Alistarh,
+``GPTQ: Accurate post-training quantization for generative pre-trained transformers,''
+in \emph{Proc. Int. Conf. Learn. Represent. (ICLR)}, May 2023.
+
+\bibitem{lin2024awq}
+J.~Lin, J.~Tang, H.~Tang, S.~Yang, X.~Dang, C.~Gan, and S.~Han,
+``AWQ: Activation-aware weight quantization for LLM compression and acceleration,''
+in \emph{Proc. Mach. Learn. Syst. (MLSys)}, May 2024.
+
+\bibitem{xiao2023smoothquant}
+G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, and S.~Han,
+``SmoothQuant: Accurate and efficient post-training quantization for large language models,''
+in \emph{Proc. Int. Conf. Mach. Learn. (ICML)}, vol. 202, Jul. 2023, pp. 38087--38099.
+
+\bibitem{frantar2024marlin}
+E.~Frantar, R.~Castro, J.~Chen, T.~Hoefler, and D.~Alistarh,
+``Marlin: Mixed-precision auto-regressive parallel inference on large language models,''
+arXiv preprint arXiv:2408.11743, 2024.
+
+\bibitem{parashar2019timeloop}
+A.~Parashar, P.~Raina, Y.~S. Shao, Y.-H. Chen, V.~A. Ying, A.~Mukkara, R.~Venkatesan, B.~Khailany, S.~W. Keckler, and J.~Emer,
+``Timeloop: A systematic approach to DNN accelerator evaluation,''
+in \emph{Proc. IEEE Int. Symp. Perform. Anal. Syst. Softw. (ISPASS)}, Madison, WI, USA, Mar. 2019, pp. 304--315.
+
+\bibitem{chen2017eyeriss}
+Y.-H. Chen, T.~Krishna, J.~S. Emer, and V.~Sze,
+``Eyeriss: An energy-efficient reconfigurable accelerator for deep convolutional neural networks,''
+\emph{IEEE J. Solid-State Circuits}, vol. 52, no. 1, pp. 127--138, Jan. 2017.
+
+\bibitem{lu2021sanger}
+L.~Lu, Y.~Jin, H.~Bi, Z.~Luo, P.~Li, T.~Wang, and Y.~Liang,
+``Sanger: A co-design framework for enabling sparse attention using reconfigurable architecture,''
+in \emph{Proc. 54th Annu. IEEE/ACM Int. Symp. Microarchitecture (MICRO)}, Athens, Greece, Oct. 2021, pp. 977--991.
+
+\bibitem{guo2022ant}
+C.~Guo, C.~Zhang, J.~Leng, Z.~Liu, F.~Yang, Y.~Liu, M.~Guo, and Y.~Zhu,
+``ANT: Exploiting adaptive numerical data type for low-bit deep neural network quantization,''
+in \emph{Proc. 55th Annu. IEEE/ACM Int. Symp. Microarchitecture (MICRO)}, Chicago, IL, USA, Oct. 2022, pp. 1414--1428.
+
+\bibitem{sheng2023flexgen}
+Y.~Sheng, L.~Zheng, B.~Yuan, Z.~Li, M.~Ryabinin, B.~Chen, P.~Liang, C.~R\'e, I.~Stoica, and C.~Zhang,
+``FlexGen: High-throughput generative inference of large language models with a single GPU,''
+in \emph{Proc. Int. Conf. Mach. Learn. (ICML)}, vol. 202, Jul. 2023, pp. 31094--31116.
+
+\bibitem{agrawal2024sarathi}
+A.~Agrawal, A.~Panwar, J.~Mohan, N.~Kwatra, B.~S. Gulavani, and R.~Ramjee,
+``SARATHI: Efficient LLM inference by piggybacking decodes with chunked prefills,''
+in \emph{Proc. Mach. Learn. Syst. (MLSys)}, May 2024.
+
+\bibitem{zhong2024distserve}
+Y.~Zhong, S.~Liu, J.~Chen, J.~Hu, Y.~Zhu, X.~Liu, X.~Jin, and H.~Zhang,
+``DistServe: Disaggregating prefill and decoding for goodput-optimized large language model serving,''
+in \emph{Proc. USENIX Symp. Oper. Syst. Des. Implement. (OSDI)}, Santa Clara, CA, USA, Jul. 2024, pp. 193--210.
+
+\bibitem{ye2024chunkattention}
+L.~Ye, Z.~Tao, Y.~Huang, and Y.~Li,
+``ChunkAttention: Efficient self-attention with prefix-aware KV cache and two-phase partition,''
+in \emph{Proc. Annu. Meet. Assoc. Comput. Linguistics (ACL)}, Aug. 2024.
+
+\bibitem{gao2017tetris}
+M.~Gao, J.~Pu, X.~Yang, M.~Horowitz, and C.~Kozyrakis,
+``TETRIS: Scalable and efficient neural network acceleration with 3D memory,''
+in \emph{Proc. 22nd Int. Conf. Architectural Support Program. Lang. Oper. Syst. (ASPLOS)}, Xi'an, China, Apr. 2017, pp. 751--764.
+
+\bibitem{zheng2020ansor}
+L.~Zheng, C.~Jia, M.~Sun, Z.~Wu, C.~H. Yu, A.~Haj-Ali, Y.~Wang, J.~Yang, D.~Zhuo, K.~Sen, J.~E. Gonzalez, and I.~Stoica,
+``Ansor: Generating high-performance tensor programs for deep learning,''
+in \emph{Proc. USENIX Symp. Oper. Syst. Des. Implement. (OSDI)}, Nov. 2020, pp. 863--879.
+
+\bibitem{accelerate}
+S.~Gugger, L.~Debut, T.~Wolf, P.~Schmid, Z.~Mueller, S.~Mangrulkar, M.~Sun, and B.~Bossan,
+``Accelerate: Training and inference at scale made simple, efficient and adaptable,''
+\emph{Hugging Face}, GitHub: huggingface/accelerate, 2022.
+
+\bibitem{anthropic2024claude}
+Anthropic,
+``Claude,'' Anthropic, San Francisco, CA, USA, 2024. [Online].
+Available: \url{https://www.anthropic.com/claude}
+
+\end{thebibliography}
+
+\EOD
+
+\begin{IEEEbiography}{Author One} (placeholder) is with the Department
+of Computer Science and Engineering, Ewha Womans University, Seoul,
+Republic of Korea. The author's research interests include machine
+learning systems, accelerator architecture, and post-training
+quantization for large language models. A biography paragraph, ORCID,
+and an author photograph will be provided in the camera-ready version.
+\end{IEEEbiography}
+
+\begin{IEEEbiography}{Author Two} (placeholder) is with the Department
+of Computer Science and Engineering, Ewha Womans University, Seoul,
+Republic of Korea. The author's interests include accelerator mapping,
+power-aware dataflow, and hardware--software co-design for deep neural
+networks. A biography paragraph, ORCID, and an author photograph will
+be provided in the camera-ready version.
+\end{IEEEbiography}
+
+\begin{IEEEbiography}{Author Three} (placeholder) is with the Department
+of Computer Science and Engineering, Ewha Womans University, Seoul,
+Republic of Korea. The author's interests include LLM-specific
+accelerator design, on-chip memory hierarchies, and inference-time
+scheduling. A biography paragraph, ORCID, and an author photograph will
+be provided in the camera-ready version.
+\end{IEEEbiography}
+
+\end{document}

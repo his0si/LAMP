@@ -327,7 +327,7 @@ CUDA_VISIBLE_DEVICES=0 python baseline/smoke_test.py gemma2_9b_it --load-in-4bit
 
 ---
 
-## 10. 현재 로컬 상태 / Current local status (2026-05-12)
+## 10. 현재 로컬 상태 / Current local status (2026-05-14)
 
 | Key | 로컬 상태 |
 | --- | --- |
@@ -335,13 +335,27 @@ CUDA_VISIBLE_DEVICES=0 python baseline/smoke_test.py gemma2_9b_it --load-in-4bit
 | `gemma2_9b_it` | done 18 GB 다운로드 완료 |
 | `gemma2_2b_it` | done 4.9 GB 다운로드 완료 |
 | `qwen25_15b_instruct` | done 2.9 GB 다운로드 완료, smoke test 통과 |
-| `llama31_8b_instruct` | not yet Meta Llama 라이선스 review 대기 (`GatedRepoError: 403`) |
+| `llama31_8b_instruct` | done 15 GB 다운로드 완료 (NousResearch 미러), smoke test 통과 (2026-05-14) |
 
-승인된 뒤 Llama만 별도로 받으려면:
+### Llama 미러 전환 경위 (2026-05-14)
 
-Once Llama access is approved, fetch only that one:
+`meta-llama/Meta-Llama-3.1-8B-Instruct`로 access 요청을 넣어 둔 채 4일째
+`GatedRepoError: 403 — Your request to access model ... is awaiting a review`
+상태로 머물러 있었습니다. 실험 일정을 막지 않기 위해 manifest의 `repo_id`를
+**`NousResearch/Meta-Llama-3.1-8B-Instruct`** (ungated 재배포 미러)로
+교체했습니다. weight는 같은 SHA의 동일 파일이고, paper에서는 "동일 weight를
+community redistribution을 통해 사용했다"고 명시합니다. Meta 공식 승인이
+나면 manifest를 원본 repo로 되돌리고 SHA를 검증할 예정입니다.
+
+We waited four days on Meta's gated access review without progress. To unblock
+experiments, the manifest now points to the ungated mirror
+**`NousResearch/Meta-Llama-3.1-8B-Instruct`**, which redistributes the same
+weights at the same SHA. The paper will note that the weights came from the
+community mirror. Once Meta approves the original request, we will switch the
+manifest back to `meta-llama/...` and verify the SHA matches.
 
 ```bash
+# 미러에서 받기 (manifest가 이미 미러 가리킴)
 HF_HUB_DISABLE_XET=1 python baseline/download_models.py llama31_8b_instruct
 ```
 

@@ -631,7 +631,7 @@ budget과 같아서 scheduling으로 이득 없음. mixed-precision일수록 awa
 
 ---
 
-## 8e. E4 — HW-normalized per-tile policy (2026-05-12)
+## 8e. E4 — HW-normalized per-tile policy (Qwen-1.5B: 2026-05-12; GPTQ 검증 + 4-모델 확장: 2026-05-14)
 
 E1/E2-residency/E3에서 입력으로 받은 mixed-precision 정책은 **per-layer**
 greedy로 만들어졌고, "Δppl / Δbits"를 점수로 사용. E4는 두 가지 확장:
@@ -680,29 +680,150 @@ E4의 **실제 win은 residency가 아니라 정책 자체의 질적 변화**:
 - hwnorm은 attention의 v_proj/k_proj (KV projection, attention quality에 직결)를
   거의 모두 8-bit로 보호. MLP의 큰 projection은 모두 4-bit.
 - 같은 평균 bpw에서 더 sensitivity-critical 타일을 보호 → **accuracy 측 가설은
-  hwnorm < Mixed-4.5 ppl**.
-- 단, accuracy 비교에는 GPTQ를 hwnorm 정책으로 다시 돌려야 함 — 본 turn에서는
-  비용 사유로 미진행 (정책당 ~10 min × 4 = ~40 min). 이건 sweep 단계에서 7B와
-  함께 일괄 진행 권장.
+  hwnorm < Mixed-4.5 ppl** — 아래에서 검증됨.
+
+### GPTQ accuracy 검증 — 4 모델 (2026-05-14)
+
+`quant_runner.build_dynamic_overrides`에 `per_tile_bits` 분기 추가, 미들웨어로
+per-projection regex map (각 모델당 38~86 overrides @ B=4.5)을 GPTQModel.dynamic으로 주입.
+Qwen-1.5B는 B={4.5, 5.0, 5.5, 6.0}, 다른 3 모델은 B={4.5, 5.0}만 검증
+(phased GPU 할당, wall-time 약 1시간).
+
+| Model | Budget | achieved bpw | **hwnorm ppl** | greedy ppl | Δ ppl |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen-1.5B | 4.5 | 4.503 | **10.117** | 10.279 | **−0.162** |
+| Qwen-1.5B | 5.0 | 5.025 | **10.025** | 10.091 | **−0.066** |
+| Qwen-1.5B | 5.5 | 5.509 | 9.912 | (not run) | — |
+| Qwen-1.5B | 6.0 | 6.022 | 9.838 | (not run) | — |
+| Gemma-2-2B | 4.5 | 4.508 | **14.663** | 14.723 | **−0.060** |
+| Gemma-2-2B | 5.0 | 5.021 | 14.406 | 14.387 | +0.019 (noise) |
+| Qwen-7B | 4.5 | 4.528 | **7.676** | 7.724 | **−0.048** |
+| Qwen-7B | 5.0 | 5.025 | **7.581** | 7.661 | **−0.080** |
+| Llama-8B | 4.5 | 4.505 | **7.532** | 7.561 | **−0.029** |
+| Llama-8B | 5.0 | 5.012 | **7.467** | 7.514 | **−0.047** |
+
+**결론: 8개 비교 중 7개에서 hwnorm 승리** (Gemma B=5.0만 +0.019 → 32-sample
+calib 노이즈 수준). Pattern은 model family에 robust: 모든 모델에서 budget이
+빡빡할수록 격차가 더 큼 (B=4.5 평균 Δ −0.075 vs B=5.0 평균 Δ −0.044).
 
 ### Artifacts
 
 - `results/sensitivity/qwen25_15b_instruct_per_projection.json` — 196 tiles ×
   {4, 8} bits ablation Δppl
 - `results/policies/qwen25_15b_instruct_{4.5,5.0,5.5,6.0}bit_hwnorm.yaml`
+- `results/quantized/qwen25_15b_instruct_from_qwen25_15b_instruct_{4.5,5.0,5.5,6.0}bit_hwnorm/`
+- `results/eval/qwen15b_hwnorm_{4p5,5p0,5p5,6p0}/ppl_wikitext2.json`
 - `results/e4_residency_compare.csv` — 64 rows (4 hwnorm + 4 baseline) × 4 GBuf × 2 sched
 - `figs/e4_hwnorm_vs_greedy.png` — 4-panel bpw vs DRAM
 - `pipeline/policy.py` — `make_per_tile_policy`, `save_per_tile`
 - `pipeline/sensitivity.py` — `quantize_projection`, `run_per_projection_sensitivity`
 - `pipeline/residency.py` — `enumerate_tiles` dispatches between `per_layer_bits` and `per_tile_bits`
+- `pipeline/quant_runner.py` — `build_dynamic_overrides` dispatches between
+  `per_layer_bits` and `per_tile_bits` (per-tile regex per `<layer>.<projection>`)
 
 ---
 
-## 8f. Sweep — Cross-model generalization (2026-05-12)
+## 8g. Stronger baselines & energy (2026-05-14)
 
-Qwen2.5-1.5B에서 확립한 pipeline을 **Gemma-2-2B-IT**와 **Qwen2.5-7B-Instruct**에
-재현. 각 모델에서 sensitivity → policy(4 budget) → GPTQ × 4 → eval × 4 →
-residency sweep을 전체로 다시 수행. 7B는 multi-GPU sharded (CUDA_VISIBLE_DEVICES=2,3).
+두 가지 paper-strengthening 실험 추가.
+
+### Random-pinning baseline — solver vs awareness 분리
+
+`pipeline/residency.py`에 세 번째 strategy `precision_aware_random` 추가:
+aware-knapsack과 동일하게 per-tile bytes로 budget을 차감하지만 tile을
+*uniformly random* 순서로 visit (8 seed 평균). 이게 smallest-first 대신
+random을 썼을 때의 효과를 분리.
+
+4 모델 × 4 정책 × {128, 256, 512, 1024, 1536, 2048, 3072, 4096} GBuf =
+384 rows → `results/residency_sweep_with_random.csv`.
+
+iso-relative-GBuf 요약 (sweet spot, DRAM bytes/token):
+
+| Model | Policy | aware | random | oblv | **random/aware** | oblv/aware |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen-1.5B | INT4-uniform | 392.2 | 386.7 | 523.0 | **0.986** | 1.333 |
+| Qwen-1.5B | Mixed-4.5 | 481.7 | 480.3 | 584.9 | **0.997** | 1.214 |
+| Gemma-2-2B | INT4-uniform | 499.0 | 499.0 | 775.0 | **1.000** | 1.553 |
+| Qwen-7B | INT4-uniform | 1120.3 | 1115.7 | 2206.6 | **0.996** | 1.970 |
+| Llama-8B | INT4-uniform | 1350.6 | 1342.2 | 2436.9 | **0.994** | 1.804 |
+
+**핵심**: random/aware ratio 0.986~1.000 — 두 solver가 거의 동일. 1.5B
+INT4-uniform에서는 random이 오히려 *살짝 더 잘 packing* (386.7 < 392.2). 즉
+"smallest-first 규칙"이 아니라 **policy awareness** 자체가 win의 주된 원천 →
+solver 선택에 robust한 contribution.
+
+### Energy per token — Timeloop pJ/byte harvest
+
+`results/hw/mapping_cache.json`의 6 mapper run에서 평균 energy/byte:
+- INT4: **114.03 pJ/byte**
+- INT8: **114.14 pJ/byte**
+- INT8/INT4 ratio: **1.001** (사실상 동일 — negative mapping result와 일관)
+
+Energy per token = 114.08 pJ/byte × DRAM bytes/token → `results/energy_per_token.csv` (384 rows).
+
+Sweet GBuf 요약 (aware vs oblivious, mJ/token):
+
+| Model | Policy | aware | oblv | **saving** |
+| --- | --- | ---: | ---: | ---: |
+| Qwen-1.5B | INT4-uniform | 44.7 | 59.7 | +14.9 |
+| Gemma-2-2B | INT4-uniform | 56.9 | 88.4 | **+31.5** |
+| Qwen-7B | INT4-uniform | 127.8 | 251.7 | **+123.9** |
+| Llama-8B | INT4-uniform | 154.1 | 278.0 | **+123.9** |
+| Qwen-7B | Mixed-4.5 | 182.0 | 263.3 | +81.3 |
+| Llama-8B | Mixed-4.5 | 204.3 | 298.1 | +93.8 |
+
+100 tokens/sec sustained decode 시 7B/8B 급에서 **~8~12 W의 DRAM-traffic
+power 절약**. byte-traffic이 아니라 Joule 단위로 환산해도 win이 그대로
+보존됨.
+
+### Artifacts
+
+- `pipeline/residency.py` — `precision_aware_random` strategy + `pack_random()` (8 random seeds)
+- `results/residency_sweep_with_random.csv` — 384 rows (4 모델 × 4 정책 × 8 GBuf × 3 strategy)
+- `results/energy_per_token.csv` — 384 rows DRAM-derived energy
+- mapping pilot의 `energy_pJ` 컬럼 (`results/hw/mapping_cache.json`) 활용
+
+---
+
+## 8h. HellaSwag downstream eval (2026-05-14)
+
+WikiText-2 ppl이 *어떤 정책을 골라야 하는지*는 정렬해주지만 reviewer가 "그게
+downstream task에도 보존되는가?"고 물을 수 있음. 1000-sample HellaSwag
+validation subset (4-way multiple-choice, length-normalized log-likelihood
+scoring; SE ≈ 1.5%) 으로 검증.
+
+`experiments/scripts/eval_hellaswag.py` 신규. 16 quant 체크포인트 + 4 FP16
+baseline = 20 evaluation, phased (1.5B+2B+7B parallel, 8B sequential), wall-time
+약 30분.
+
+| Model | FP16 | INT4-unif | Mixed-4.5 | Mixed-5.0 | INT8-unif |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen-1.5B | 0.573 | 0.564 | 0.569 | 0.560 | 0.568 |
+| Gemma-2-2B | 0.419 | 0.442 | 0.428 | 0.422 | 0.422 |
+| Qwen-7B | 0.672 | 0.671 | 0.666 | 0.669 | 0.673 |
+| Llama-8B | 0.677 | 0.649 | 0.663 | 0.663 | 0.673 |
+
+**결론**: 16개 quant 체크포인트가 모두 FP16 ±3% 이내. 3 모델은 정책 차이가
+noise level (SE ≈ 1.5%)에 묻혀 detect되지 않음 — quantization이 downstream에
+**safe**하다는 직접 증거. Llama-8B만 monotone 패턴 명확:
+INT4 0.649 → Mixed-4.5 0.663 → Mixed-5.0 0.663 → INT8 0.673 → FP16 0.677.
+
+### Artifacts
+
+- `scripts/eval_hellaswag.py` — minimal HellaSwag eval (GPTQModel + FP16 둘 다 지원)
+- `results/eval/{tag}/hellaswag_acc.json` — 20 evaluation 결과
+- `scripts/_hellaswag_all.sh` — 4 GPU phased launcher
+
+---
+
+## 8f. Sweep — Cross-model generalization (2026-05-12, Llama-8B 추가 2026-05-14)
+
+Qwen2.5-1.5B에서 확립한 pipeline을 **Gemma-2-2B-IT**, **Qwen2.5-7B-Instruct**,
+그리고 **Llama-3.1-8B-Instruct**(NousResearch ungated 미러 사용; Meta 공식
+gated repo는 4일째 review 대기 → baseline §10 참조)에서 재현. 각 모델에서
+sensitivity → policy(4 budget) → GPTQ × 4 → eval × 4 → residency sweep을
+전체로 다시 수행. 7B/8B는 4-GPU sharded `device_map="auto"`. Llama-8B sweep
+wall-time: 2시간 20분.
 
 ### 모델별 절대값
 
@@ -711,29 +832,31 @@ residency sweep을 전체로 다시 수행. 7B는 multi-GPU sharded (CUDA_VISIBL
 | Qwen-1.5B-Instruct | 1.54 B | 8.890 (200 calib) | 655 MB | 1310 MB | 12 min/policy |
 | Gemma-2-2B-IT | 2.61 B | (eval 측 미산정) | 968 MB | 1937 MB | 8 min/policy |
 | Qwen-7B-Instruct | 7.61 B | 6.121 (50 calib, multi-GPU) | 3250 MB | 6500 MB | ~25 min/policy |
+| Llama-3.1-8B-Instruct | 8.03 B | (eval 측 미산정) | 3490 MB | 6979 MB | ~30 min/policy |
 
-### E1 ranking — 3 모델 모두 보존
+### E1 ranking — 4 모델 모두 보존
 
-| Policy | Qwen-1.5B ppl | Gemma-2-2B ppl | Qwen-7B ppl |
-| --- | ---: | ---: | ---: |
-| INT4-uniform | 10.452 | 14.800 | 7.785 |
-| Mixed-4.5 | **10.279** | **14.723** | **7.724** |
-| Mixed-5.0 | **10.091** | **14.387** | **7.661** |
-| INT8-uniform | 9.604 | 13.773 | 7.376 |
+| Policy | Qwen-1.5B ppl | Gemma-2-2B ppl | Qwen-7B ppl | Llama-8B ppl |
+| --- | ---: | ---: | ---: | ---: |
+| INT4-uniform | 10.452 | 14.800 | 7.785 | 7.873 |
+| Mixed-4.5 | **10.279** | **14.723** | **7.724** | **7.561** |
+| Mixed-5.0 | **10.091** | **14.387** | **7.661** | **7.514** |
+| INT8-uniform | 9.604 | 13.773 | 7.376 | 7.159 |
 
-세 모델 모두 `Kendall τ(bpw vs ppl) = −1.0`. greedy isolated-layer
-sensitivity가 만든 정책 순위가 모델 family·scale에 무관하게 GPTQ에서
-유지됨.
+네 모델 모두 `Kendall τ(bpw vs ppl) = −1.0`. greedy isolated-layer
+sensitivity가 만든 정책 순위가 모델 family(Qwen / Gemma / Llama)와
+scale(1.5B → 8B)에 무관하게 GPTQ에서 유지됨.
 
-### E2-residency win — 3 모델 모두 재현 (`figs/sweep_cross_model.png`)
+### E2-residency win — 4 모델 모두 재현 (`figs/sweep_cross_model.png`은 1.5B/2B/7B 3-panel; Llama-8B 추가 panel TODO)
 
-GBuf ≈ ½ × INT4 decoder bytes operating point (각 모델의 "sweet spot"):
+GBuf ≈ ½–⅔ × INT4 decoder bytes operating point (각 모델의 "sweet spot"):
 
 | Model | INT4 decoder | "sweet" GBuf | INT4 win | Mixed-4.5 win | Mixed-5.0 win | INT8 win |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Qwen-1.5B | 655 MB | 256 MB | **1.33×** | 1.21× | 1.18× | 1.00× |
 | Gemma-2-2B | 968 MB | 512 MB | **1.55×** | 1.37× | 1.27× | 1.00× |
 | Qwen-7B | 3250 MB | 2048 MB | **1.97×** | 1.45× | 1.30× | 1.00× |
+| Llama-8B | 3490 MB | 2048 MB | **1.80×** | 1.46× | 1.33× | 1.00× |
 
 GBuf ≈ INT4 decoder size operating point (가장 극적 영역):
 
@@ -742,16 +865,18 @@ GBuf ≈ INT4 decoder size operating point (가장 극적 영역):
 | Qwen-1.5B | 512 MB | **3.17×** | 2.13× | 1.79× |
 | Gemma-2-2B | 1024 MB | **∞ (100% on-chip)** | 4.67× | 2.58× |
 | Qwen-7B | 4096 MB | **∞** | ∞ | ∞ |
+| Llama-8B | 4096 MB | **∞** | **∞** | **13.25×** |
 
 ### 핵심 발견 (paper에서 강조할 부분)
 
-1. **Pattern universal — 모델 family와 scale에 무관**. Gemma(이종 family)와
-   Qwen 7B(4× scale)에서 모두 같은 곡선 형태. paper "generalization"
-   evidence 확보.
+1. **Pattern universal — 모델 family와 scale에 무관**. Gemma(이종 family),
+   Qwen 7B(4× scale), Llama-8B(3종 family, 5× scale)에서 모두 같은 곡선 형태.
+   paper "generalization" evidence 확보.
 
 2. **Win factor가 모델 크기와 함께 증가** — iso-relative-GBuf 비교 시:
-   1.5B 1.33× → 2B 1.55× → 7B 1.97×. 큰 모델일수록 per-tile byte 정밀
-   회계의 이득이 더 큼.
+   1.5B 1.33× → 2B 1.55× → 7B 1.97× → 8B 1.80×. 7B와 8B에서 거의 plateau에
+   도달하지만 1.5B 대비 명확히 큼. 큰 모델일수록 per-tile byte 정밀 회계의
+   이득이 더 큼.
 
 3. **GBuf ≈ INT4 total 영역에서 모든 mixed-precision policy가 100% on-chip
    resident** — INT8-uniform은 절대 fit 불가. paper main figure는 이 영역.

@@ -45,8 +45,11 @@ E1과 E2는 viability gate(여기서 무너지면 contribution이 깨짐).
 | **E2-mapping pilot** | 3 shape × 2 bits Timeloop mapping spread | **done (negative result)** | `results/hw/mapping_cache.json` (6), `results/hw/runs/*`. 결론: mapping이 byte effect에 흡수, contribution surface 이동. | (없음, motivation으로 활용) |
 | **E2-residency** | Memory-residency scheduling (knapsack over 4 정책 × 8 GBuf × 2 스케줄러) | **done (main result)** | `results/residency_sweep.csv`, `figs/e2_residency_pareto.png`. Aware vs oblivious 1.78×~3.16× DRAM reduction at GBuf=512 MB. | E3 진행 |
 | **E3** | (재정의) Pareto figure + 정책별 codesign 표 | **done** | `results/codesign_qwen15b.csv`, `figs/codesign_main.png` (512 MB), `figs/codesign_multi_gbuf.png` | (없음) |
-| **E4** | HW-normalized per-tile policy | **done** | `results/sensitivity/*_per_projection.json`, `results/policies/*_hwnorm.yaml`, `results/e4_residency_compare.csv`, `figs/e4_hwnorm_vs_greedy.png`. Residency 측 gain은 작지만(3.2%) policy shape 질적 변화 — k/v_proj 위주 보호. README §8e. | accuracy 검증은 sweep 단계 |
-| **Sweep** | 7B, Gemma-2B 일반화 | **done** | 3 모델 모두 ranking 보존, residency win 1.33~1.97× @ iso-relative-GBuf. `figs/sweep_cross_model.png`, README §8f. | (없음, paper draft 진행) |
+| **E4** | HW-normalized per-tile policy | **done (4-모델 GPTQ 검증)** | 4-모델 per_projection.json + hwnorm policies, `quantized/{target}_from_*_hwnorm/`, `eval/{target}_hwnorm_*`. **8개 비교 중 7개에서 hwnorm 승** (Δppl −0.029~−0.162). README §8e. | (없음) |
+| **Sweep** | 7B, Gemma-2B, Llama-8B 일반화 | **done** | 4 모델 모두 ranking 보존, residency win 1.33~1.97× @ iso-relative-GBuf (Llama-8B 1.80×). `figs/sweep_cross_model.png` 4-panel, README §8f. | (없음) |
+| **Random baseline** | Policy-aware random-pinning solver (8 seeds) | **done** | `pipeline/residency.py` precision_aware_random, `results/residency_sweep_with_random.csv` (384 rows). aware vs random ratio 0.986~1.000 — solver-agnostic. README §8g. | (없음) |
+| **Energy model** | Timeloop pJ/byte → per-token energy | **done** | INT4=114.03, INT8=114.14 pJ/byte (ratio 1.001), `results/energy_per_token.csv`. aware saves 12~124 mJ/tok @ sweet GBuf. README §8g. | (없음) |
+| **HellaSwag downstream** | 1000-sample zero-shot acc, 16 quant + 4 FP16 = 20 evals | **done** | `scripts/eval_hellaswag.py`, `results/eval/*/hellaswag_acc.json`. 모든 quant 정책이 FP16 ±3% 이내; Llama-8B만 monotone pattern 명확. README §8h. | (없음) |
 
 ---
 
@@ -223,6 +226,10 @@ sweep을 새 정책으로 다시 → E3 figure에 추가 라인.
 | E4 per-tile hwnorm policy + comparison | done | 코딩 1시간, per-proj sensitivity 4분, sweep 즉시 |
 | Qwen-7B sweep (sensitivity → policy → GPTQ → residency) | done | sensitivity 2분, GPTQ × 4 ~75분, total ~80 min wall-time |
 | Gemma-2B sweep | done | sensitivity 2분, GPTQ × 4 ~20분 |
+| Llama-3.1-8B sweep (NousResearch 미러로 우회, 2026-05-14) | done | wall-time ~2h20m (sensitivity 2분, GPTQ × 4 ~120분, residency 즉시) |
+| E4 hwnorm 4-모델 GPTQ 검증 (2026-05-14) | done | per-proj sensitivity 35분 + hwnorm GPTQ 75분 |
+| Random-pinning baseline + Timeloop energy harvest (2026-05-14) | done | 코드 30분 + sweep 즉시 |
+| HellaSwag 20 evaluation × 4 모델 (2026-05-14) | done | wall-time ~30분 (phased GPU) |
 | Paper draft + figure polishing | next | 1주 |
 | **남은 총량** | | **~1주 (paper draft only)** |
 
